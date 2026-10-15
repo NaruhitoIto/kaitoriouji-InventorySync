@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-15T15:03:30Z",
+  "generated_at": "2026-10-15T19:12:41Z",
   "docs": {
     "2026-10-13": {
       "date": "2026-10-13",
@@ -275,15 +275,15 @@
     },
     "2026-10-15": {
       "date": "2026-10-15",
-      "ordered_total": 5465039,
-      "ordered_count": 3750,
-      "ordered_qty": 3781,
+      "ordered_total": 5649133,
+      "ordered_count": 3890,
+      "ordered_qty": 3921,
       "shipped_total": 4279130,
       "shipped_count": 3406,
       "shops": [
         {
           "id": 1,
-          "ordered": 1404338,
+          "ordered": 1419881,
           "shipped": 808047,
           "qty": 1387,
           "count": 929
@@ -297,10 +297,10 @@
         },
         {
           "id": 5,
-          "ordered": 1652550,
+          "ordered": 1821101,
           "shipped": 1795401,
-          "qty": 1334,
-          "count": 1241
+          "qty": 1474,
+          "count": 1372
         },
         {
           "id": 6,
@@ -411,18 +411,18 @@
     },
     "2026-10-16": {
       "date": "2026-10-16",
-      "ordered_total": 350,
-      "ordered_count": 4,
-      "ordered_qty": 5,
+      "ordered_total": 176212,
+      "ordered_count": 184,
+      "ordered_qty": 188,
       "shipped_total": 0,
       "shipped_count": 0,
       "shops": [
         {
           "id": 1,
-          "ordered": 0,
+          "ordered": 52452,
           "shipped": 0,
-          "qty": 4,
-          "count": 3
+          "qty": 70,
+          "count": 47
         },
         {
           "id": 4,
@@ -433,10 +433,10 @@
         },
         {
           "id": 5,
-          "ordered": 0,
+          "ordered": 35354,
           "shipped": 0,
-          "qty": 0,
-          "count": 0
+          "qty": 40,
+          "count": 37
         },
         {
           "id": 6,
@@ -468,17 +468,17 @@
         },
         {
           "id": 22,
-          "ordered": 0,
+          "ordered": 1095,
           "shipped": 0,
-          "qty": 0,
-          "count": 0
+          "qty": 2,
+          "count": 2
         },
         {
           "id": 25,
-          "ordered": 0,
+          "ordered": 886,
           "shipped": 0,
-          "qty": 0,
-          "count": 0
+          "qty": 1,
+          "count": 1
         },
         {
           "id": 26,
@@ -517,10 +517,10 @@
         },
         {
           "id": 31,
-          "ordered": 350,
+          "ordered": 86425,
           "shipped": 0,
-          "qty": 1,
-          "count": 1
+          "qty": 75,
+          "count": 75
         },
         {
           "id": 32,

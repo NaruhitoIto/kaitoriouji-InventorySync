@@ -75,7 +75,7 @@ def load_configs():
 IN_STOCK_QUERY = {"在庫数": {"eq": "1"}}  # 在庫1の商品だけを取得する絞り込み
 
 
-def fetch_page(cfg, page, query=None):
+def fetch_page(cfg, page, query=None, sort="product_id"):
     """/api/products/search を1ページ取得する。429/5xx は少し待ってリトライ。"""
     url = f"{cfg['base_url'].rstrip('/')}/api/products/search"
     headers = {
@@ -84,7 +84,7 @@ def fetch_page(cfg, page, query=None):
         "Accept": "application/json",
     }
     body = {
-        "sort": "product_id",
+        "sort": sort,
         "reverse": False,
         "page": page,
         "limit": cfg["page_limit"],
@@ -107,27 +107,40 @@ def fetch_page(cfg, page, query=None):
 
 
 def iter_products(cfg, max_pages=None, query=None):
-    """全ページの商品を順に返す。途中で件数が足りなければ例外にする（部分取得で誤送信しないため）。"""
-    page = 1
-    fetched = 0
+    """該当する全商品を商品番号の昇順で返す（query に商品番号の条件は入れないこと）。
+    ページ番号（オフセット）で進めると、取得中（全件で数十分）に売れて結果から消えた商品の分だけ
+    後ろの商品が前にずれ、ページ境界の商品を取りこぼす。そのため「前ページ最後の商品番号以上」を
+    条件に次のページを取る（product_id は絞り込みに使えないため商品番号を使う）。
+    境界の商品は両方のページに出るので product_id で重複を除く。"""
+    limit = cfg["page_limit"]
+    seen = set()
+    cursor = None
+    first_total = None
+    page = 0
     while True:
-        data = fetch_page(cfg, page, query)
+        page += 1
+        q = dict(query or {})
+        if cursor is not None:
+            q["商品番号"] = {"gte": cursor}
+        data = fetch_page(cfg, 1, q, sort="商品番号")
         items = data.get("data", [])
-        total = data.get("total") or 0
-        log.info(f"ページ {page}: {len(items)}件 (total={total})")
-        if not items:
-            break
-        for item in items:
-            fetched += 1
+        total = data.get("total") or 0  # この位置（商品番号）以降の該当件数
+        if first_total is None:
+            first_total = total
+        new = [it for it in items if it.get("product_id") not in seen]
+        log.info(f"ページ {page}: {len(new)}件 (この位置以降 total={total})")
+        for item in new:
+            seen.add(item.get("product_id"))
             yield item
         if max_pages and page >= max_pages:
             break
-        if total and page * cfg["page_limit"] >= total:
-            if fetched < total - cfg["page_limit"]:
-                raise RuntimeError(f"取得件数が不足しています（{fetched} / {total}）")
-            break
-        page += 1
+        if len(items) < limit and total <= len(items):
+            break  # 最後のページ
+        if not new:
+            raise RuntimeError(f"取得が先に進みません（商品番号 {cursor} 以降の該当 {total}件）")
+        cursor = str(items[-1].get("商品番号") or "")
         time.sleep(0.4)  # 速度制限（約3リクエスト/秒）を守る
+    log.info(f"取得完了: {len(seen):,}件（開始時の該当 {first_total:,}件）")
 
 
 def listing_status(item, mall_name):
@@ -173,6 +186,33 @@ def collect_stock(cfg, max_pages=None, query=None):
         f"在庫数不正: {skipped_bad_stock:,}件"
     )
     return stock
+
+
+RECHECK_BATCH = 400  # 再確認で1回に問い合わせる商品番号の数（limit より少なくし、同じ商品番号の重複に余裕を残す）
+
+
+def recheck_in_stock(cfg, skus):
+    """商品番号の完全一致（in・大文字小文字は区別されない）でまとめて問い合わせ、
+    在庫1以上かつ楽天出品中のSKU（小文字）を返す。差分モードで「在庫0になった」と判定したSKUを、
+    送信直前の最新状態で確かめ直すために使う（400件ずつ・1回2秒ほど）。"""
+    found = set()
+    for start in range(0, len(skus), RECHECK_BATCH):
+        batch = skus[start:start + RECHECK_BATCH]
+        page, got = 1, 0
+        while True:
+            # 在庫で絞り込まないので、取得中に売れても結果はずれない（ページ番号で進めてよい）
+            data = fetch_page(cfg, page, {"商品番号": {"in": batch}})
+            items = data.get("data", [])
+            for item in items:
+                if parse_stock(item.get("在庫数")) and is_rakuten_listed(item, cfg):
+                    found.add(str(item.get("商品番号") or "").strip().lower())
+            got += len(items)
+            if not items or got >= (data.get("total") or 0):
+                break
+            page += 1
+            time.sleep(0.4)
+        time.sleep(0.4)
+    return found
 
 
 def load_state():
@@ -403,6 +443,14 @@ def main():
         in_stock = collect_stock(cfg, query=IN_STOCK_QUERY)
         changed = {sku: 1 for sku in in_stock if state.get(sku) != 1}
         dropped = [sku for sku, q in state.items() if q == 1 and sku not in in_stock]
+        if dropped:
+            # 取得中のずれなどで一覧から漏れただけの商品に0を送らないよう、送信前に商品番号で確かめ直す
+            log.info(f"在庫0になった候補 {len(dropped):,}件を商品番号で再確認します")
+            still = recheck_in_stock(cfg, dropped)
+            if still:
+                log.warning(f"再確認で在庫あり・楽天出品中だったため0送信から外しました: {len(still):,}件 "
+                            f"（例: {', '.join(sorted(still)[:10])}）")
+                dropped = [sku for sku in dropped if sku not in still]
         for sku in dropped:
             changed[sku] = 0
         log.info(f"在庫1に戻った/新規: {len(changed) - len(dropped):,}件 / 在庫0になった: {len(dropped):,}件")

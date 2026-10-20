@@ -1,0 +1,13 @@
+; このファイルを amazon_sp_api_config.ini という名前でコピーして値を入れてください。
+; amazon_sp_api_config.ini は .gitignore 済みです（チャットやGitHubには絶対に貼らないでください）。
+[AMAZON_SP_API]
+client_id = ここにLWAのClient ID
+client_secret = ここにLWAのClient Secret
+refresh_token = ここにRefresh Token
+seller_id = ここに出品者ID
+; 日本のマーケットプレイスID
+marketplace_id = A1VC38T7YXB528
+; 日本は極東リージョン
+endpoint = https://sellingpartnerapi-fe.amazon.com
+; Amazon注文の初回取得開始時刻（以後は amazon_orders_state.json が管理）。連携が止まった 19:00 より前にする
+orders_last_checked = 2026-10-20T18:30:00+09:00

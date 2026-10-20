@@ -27,3 +27,6 @@ RakutenSkuDelete.py
 CheckJANExists_Fast.py
 __pycache__/
 *.pyc
+
+# 削除履歴（別PCへは手動でコピー）
+deleted_manage_numbers.txt

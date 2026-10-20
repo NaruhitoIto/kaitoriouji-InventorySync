@@ -1,0 +1,29 @@
+# 認証情報（GitHubに絶対に上げない）
+sftp_config.ini
+wasabi_config.ini
+wasabi_ftp_config.ini
+rakuten_api_config.ini
+*.ini.bak*
+
+# 実行時に生成されるデータ（別PCへは手動でコピー）
+wasabi_stock_state.json
+wasabi_stock_state.json.bak*
+rakuten_orders_state.json
+*.lock
+*.lock.*
+stock_csv/
+logs/
+dl/
+batch_*/
+batch_delete_csv_*/
+*.log
+
+# 古いバージョン・バックアップ
+*.bak*
+*_v4_final.py
+*_v7_local.py
+*_v8_auto_sftp.py
+RakutenSkuDelete.py
+CheckJANExists_Fast.py
+__pycache__/
+*.pyc

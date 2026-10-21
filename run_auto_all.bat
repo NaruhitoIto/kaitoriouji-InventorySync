@@ -1,11 +1,13 @@
 @echo off
+rem NOTE: keep this file ASCII-only. cmd.exe misreads multi-byte (Japanese) lines
+rem after "chcp 65001" and runs fragments of them as commands.
 chcp 65001 >nul
 cd /d "%~dp0"
-rem 1) 楽天の注文を取得して、ワサビの在庫を0にする（FTP送信）
+rem 1) Rakuten orders -> set Wasabi stock to 0 (FTP)
 python rakuten_orders_sync.py
-rem 2) ワサビの在庫を楽天へ反映する（差分・自動）
+rem 2) Wasabi stock -> Rakuten (diff, auto)
 python wasabi_stock_sync.py --auto
-rem ※ Amazon は WS の連携で動いているため、ここでは実行しない。
-rem    WS の Amazon 連携が止まったときだけ、手動で次を実行する:
-rem      python amazon_orders_sync.py      （Amazonの注文 → WS在庫0）
-rem      python amazon_stock_sync.py       （WS在庫 → Amazon。初回は Amazon の出品レポートと照合）
+rem Amazon is synced by Wasabi itself, so it is NOT run here.
+rem Only when the Wasabi Amazon sync is stopped, run these by hand:
+rem   amazon_orders_sync.py  (Amazon orders -> Wasabi stock 0)
+rem   amazon_stock_sync.py   (Wasabi stock -> Amazon)

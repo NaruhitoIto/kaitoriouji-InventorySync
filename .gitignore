@@ -50,3 +50,14 @@ cross_mall_state.json
 cross_mall_state.tmp
 inbox/
 todo/
+
+# 出荷データ作成アプリ（shipping_export/）: ビルド成果物・設定（楽天キー）・作業フォルダ
+shipping_export/.venv-build/
+shipping_export/build/
+shipping_export/dist/
+shipping_export/build_log.txt
+shipping_export/*.spec
+shipping_export/shipping_export.ini
+shipping_export/出荷データ/
+shipping_export/出力履歴.json
+出荷データ作成/

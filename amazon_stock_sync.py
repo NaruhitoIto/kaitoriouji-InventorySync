@@ -140,7 +140,10 @@ def submit_feed(acfg, part):
         rd = sp_request(acfg, "GET", f"/feeds/2021-06-30/documents/{result_id}")
         rr = requests.get(rd["url"], timeout=300)
         rr.raise_for_status()
-        report = rr.json()
+        raw = rr.content
+        if rd.get("compressionAlgorithm") == "GZIP":
+            raw = gzip.decompress(raw)  # 処理結果は GZIP 圧縮で返ることがある
+        report = json.loads(raw.decode("utf-8-sig"))
         log.info(f"処理結果サマリー: {report.get('summary')}")
         for issue in report.get("issues", []):
             if str(issue.get("severity", "")).upper() == "ERROR":

@@ -1,0 +1,13 @@
+; このファイルを mercari_shops_config.ini という名前でコピーして値を入れてください。
+; mercari_shops_config.ini は .gitignore 済みです（チャットやGitHubには絶対に貼らないでください）。
+[MERCARI_SHOPS]
+; ショップ管理画面で発行した Personal API Access Token（本番とSandboxは別のトークン）
+token = ここにアクセストークン
+; 「事業者識別名/バージョン」。事業者識別名は API 利用契約時にメルカリから提供される（ショップ名ではない）
+user_agent = ここに事業者識別名/1.0.0
+; sandbox（検証環境）か production（本番）。トークンと固定IPの登録も環境ごとに別
+environment = sandbox
+; メルカリ注文の初回取得開始時刻（以後は mercari_orders_state.json が管理）。WS連携を止める時刻より前にする
+orders_last_checked = 2026-11-01T00:00:00+09:00
+; 在庫送信・全件照合で、残りポイントがこの値を下回ったら途中で止めて次回に回す（注文取得の分を残すため）
+rate_reserve = 1500

@@ -35,3 +35,12 @@ deleted_manage_numbers.txt
 amazon_sp_api_config.ini
 amazon_stock_state.json
 amazon_orders_state.json
+
+# メルカリShops API
+mercari_shops_config.ini
+mercari_stock_state.json
+mercari_orders_state.json
+mercari_full_scan.json
+
+# 他モール連携用の WS 在庫スナップショット（wasabi_stock_sync.py が作成）
+ws_instock_snapshot.*

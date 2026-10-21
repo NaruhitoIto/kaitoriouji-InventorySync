@@ -59,6 +59,8 @@ def load_configs():
         "rakuten_status": wc.get("WASABI", "rakuten_status", fallback="出品中").strip(),
         "page_limit": wc.getint("WASABI", "page_limit", fallback=100),
         "remote_dir": wc.get("RAKUTEN", "remote_dir", fallback="ritem/batch"),
+        # 取得した在庫1の商品の出品状況を他モールの連携（mercari_stock_sync.py など）用に保存するモール名（カンマ区切り）
+        "snapshot_malls": [m.strip() for m in wc.get("WASABI", "snapshot_malls", fallback="").split(",") if m.strip()],
     }
 
     sc = configparser.ConfigParser()
@@ -163,12 +165,15 @@ def parse_stock(raw):
         return None
 
 
-def collect_stock(cfg, max_pages=None, query=None):
-    """楽天の商品番号（小文字化）→ 在庫数 の辞書を作る。"""
+def collect_stock(cfg, max_pages=None, query=None, snapshot=None):
+    """楽天の商品番号（小文字化）→ 在庫数 の辞書を作る。
+    snapshot（{モール名: {}}）を渡すと、在庫1以上の商品について {商品番号: そのモールの出品状況} も集める。"""
     stock = {}
     skipped_not_listed = 0
     skipped_bad_stock = 0
     for item in iter_products(cfg, max_pages=max_pages, query=query):
+        if snapshot is not None:
+            record_snapshot(snapshot, item)
         if not is_rakuten_listed(item, cfg):
             skipped_not_listed += 1
             continue
@@ -186,6 +191,31 @@ def collect_stock(cfg, max_pages=None, query=None):
         f"在庫数不正: {skipped_bad_stock:,}件"
     )
     return stock
+
+
+SNAPSHOT_FILE = BASE_DIR / "ws_instock_snapshot.json"
+
+
+def record_snapshot(snapshot, item):
+    sku = str(item.get("商品番号") or "").strip()
+    if not sku or not parse_stock(item.get("在庫数")):
+        return
+    for mall, statuses in snapshot.items():
+        st = listing_status(item, mall)
+        if st is not None:
+            statuses[sku] = st
+
+
+def save_snapshot(snapshot):
+    """他モールの連携用スナップショットを保存する。失敗しても楽天の処理は止めない。"""
+    try:
+        tmp = SNAPSHOT_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"created_at": datetime.now().isoformat(), "malls": snapshot}, ensure_ascii=False),
+                       encoding="utf-8")
+        tmp.replace(SNAPSHOT_FILE)
+        log.info("他モール用スナップショットを保存: " + " / ".join(f"{m} {len(s):,}件" for m, s in snapshot.items()))
+    except Exception as e:
+        log.warning(f"他モール用スナップショットを保存できませんでした: {e}")
 
 
 RECHECK_BATCH = 400  # 再確認で1回に問い合わせる商品番号の数（limit より少なくし、同じ商品番号の重複に余裕を残す）
@@ -431,16 +461,17 @@ def main():
     if auto and not state:
         raise SystemExit("自動実行には基準データが必要です。先に手動で一度 python wasabi_stock_sync.py を実行してください")
     full = mode == "--full" or (not state and not auto)
+    snapshot = {m: {} for m in cfg["snapshot_malls"]} or None
 
     if full:
         # 初回（または --full）: 全商品を取得して基準を作る（在庫0も含む）
         log.info("全件取得モードで実行します（時間がかかります）")
-        stock = collect_stock(cfg)
+        stock = collect_stock(cfg, snapshot=snapshot)
         changed = {sku: q for sku, q in stock.items() if state.get(sku) != q}
     else:
         # 通常: 在庫1の商品だけ取得し、前回1だったのに今回いないものを0にする
         log.info("差分モードで実行します（在庫1の商品のみ取得）")
-        in_stock = collect_stock(cfg, query=IN_STOCK_QUERY)
+        in_stock = collect_stock(cfg, query=IN_STOCK_QUERY, snapshot=snapshot)
         changed = {sku: 1 for sku in in_stock if state.get(sku) != 1}
         dropped = [sku for sku, q in state.items() if q == 1 and sku not in in_stock]
         if dropped:
@@ -455,6 +486,9 @@ def main():
             changed[sku] = 0
         log.info(f"在庫1に戻った/新規: {len(changed) - len(dropped):,}件 / 在庫0になった: {len(dropped):,}件")
         stock = None
+
+    if snapshot is not None:
+        save_snapshot(snapshot)
 
     log.info(f"前回送信からの変更: {len(changed):,}件")
 

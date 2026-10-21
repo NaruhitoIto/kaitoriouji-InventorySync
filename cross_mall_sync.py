@@ -28,7 +28,9 @@ WS の状態ファイル（wasabi_stock_state.json）は読むだけで変更し
 メルカリShopsの在庫一括更新ファイル:
   inbox/mercari_products/ にメルカリShopsの商品CSV（一括編集用ダウンロード）を置くと、毎回の実行で
   todo/メルカリ_在庫更新_アップロード_*.csv（商品ID, SKU1_ID, SKU1_現在の在庫数, SKU1_増減フラグ=2, SKU1_在庫増減数）を作る。
-  一度ファイルに出したSKUは次から出さない（同じ商品を二重に減らさないため）。商品CSVは新しいものに置き換えてよい。
+  一度ファイルに出したSKUは次から出さない（同じ商品を二重に減らさないため）。商品CSVは複数ファイルに分けてよく、追加してよい。
+  商品CSV（在庫ありリスト）があるときは、それをメルカリの出品一覧とみなし、手動で止める一覧（todo/メルカリ_止める_*）は作らない。
+  リストに無いSKUはメルカリに出品が無いものとして扱う（参考に todo/メルカリ_商品CSVに無い.csv を出す）。
 """
 import base64
 import configparser
@@ -488,12 +490,21 @@ def verify_amazon(state, acfg, now, dry):
                   f"{', '.join(gave_up[:20])}")
 
 
-def write_todo(state, now, dry):
+def write_todo(state, now, dry, upload_malls=()):
     """メルカリ・ヤフオクで手動で止めるSKUの一覧（今回の新規分と累計）を Excel で開ける CSV で作る。
-    メルカリは楽天と同じ商品を出品している想定のため、楽天に出品が無いSKUは一覧に入れない。"""
+    upload_malls（在庫ありリストがありアップロード用ファイルで対応するモール）は一覧を作らない。
+    メルカリのリストが無いときは、楽天と同じ商品を出品している想定で、楽天に出品が無いSKUは一覧に入れない。"""
     TODO_DIR.mkdir(exist_ok=True)
     catalog = rakuten_catalog()
     for mall, label in MANUAL_MALLS.items():
+        if mall in upload_malls:
+            new = [e for e in state["ledger"].values() if mall in e["todo"] and e["todo"][mall] is None]
+            if not dry:
+                for e in new:
+                    e["todo"][mall] = "アップロード用ファイルで対応"
+            if new:
+                log.info(f"{label}: 在庫ありリストがあるため、止める一覧は作らずアップロード用ファイルで対応します（新規 {len(new)}件）")
+            continue
         if mall in MALLS_LIKE_RAKUTEN and catalog is not None:
             skipped = 0
             for k, e in state["ledger"].items():
@@ -607,10 +618,10 @@ def load_mercari_products():
     return products, f"{len(files)}files_{newest:%Y%m%d%H%M%S}", enc
 
 
-def write_mercari_upload(state, now, dry):
+def write_mercari_upload(state, now, dry, loaded=None):
     """他モールで売れたSKUを、メルカリShopsの在庫一括更新CSV（増減フラグ=2:マイナス、在庫増減数=現在の在庫数）にする。
     一度ファイルに出したSKUは二度と出さない（二重に減らさないため）。"""
-    products, export_name, enc = load_mercari_products()
+    products, export_name, enc = loaded or load_mercari_products()
     if products is None:
         log.info("メルカリのアップロード用ファイル: inbox/mercari_products/ に商品CSVが無いため作りません")
         return
@@ -711,8 +722,9 @@ def main():
     if not validate:
         verify_amazon(state, acfg, now, dry)
     push_rakuten(state, cfg, dry, validate)
-    write_todo(state, now, dry or validate)
-    write_mercari_upload(state, now, dry or validate)
+    mercari_list = load_mercari_products()  # メルカリの在庫ありリスト（あればメルカリはアップロード用ファイルで対応）
+    write_todo(state, now, dry or validate, upload_malls={"mercari"} if mercari_list[0] is not None else set())
+    write_mercari_upload(state, now, dry or validate, mercari_list)
     if not dry and not validate:
         save_state(state)
 

@@ -44,3 +44,9 @@ mercari_full_scan.json
 
 # 他モール連携用の WS 在庫スナップショット（wasabi_stock_sync.py が作成）
 ws_instock_snapshot.*
+
+# WS停止中のモール間連携（cross_mall_sync.py）: 状態・手動取り込みファイル（注文者情報を含む）・手動作業一覧
+cross_mall_state.json
+cross_mall_state.tmp
+inbox/
+todo/

@@ -30,7 +30,11 @@ WS の状態ファイル（wasabi_stock_state.json）は読むだけで変更し
   todo/メルカリ_在庫更新_アップロード_*.csv（商品ID, SKU1_ID, SKU1_現在の在庫数, SKU1_増減フラグ=2, SKU1_在庫増減数）を作る。
   一度ファイルに出したSKUは次から出さない（同じ商品を二重に減らさないため）。商品CSVは複数ファイルに分けてよく、追加してよい。
   商品CSV（在庫ありリスト）があるときは、それをメルカリの出品一覧とみなし、手動で止める一覧（todo/メルカリ_止める_*）は作らない。
-  リストに無いSKUはメルカリに出品が無いものとして扱う（参考に todo/メルカリ_商品CSVに無い.csv を出す）。
+  リストに無いSKUはメルカリに出品が無いものとして扱う（参考に todo/参考/メルカリ_商品CSVに無い.csv を出す）。
+  在庫更新ファイルは5項目（商品ID, SKU1_ID, SKU1_現在の在庫数, SKU1_増減フラグ, SKU1_在庫増減数）。アップロードしたら
+  todo/Uploaded/ へ移す。todo/ 直下に未アップロードのファイルが残っていれば、新しい分と1つのファイルに結合する。
+
+ヤフオク: 在庫連携をやめたため、止める一覧は作らない（inbox/yahoo/ に注文ファイルを置けば、楽天・Amazon の在庫0はする）。
 """
 import base64
 import configparser
@@ -64,6 +68,7 @@ AUTO_TARGETS = ("rakuten", "amazon")  # API で自動的に0にするモール
 MANUAL_MALLS = {"mercari": "メルカリ", "yahoo": "ヤフオク"}  # 手動で止めるモール（一覧を作る）
 MALL_LABEL = {"rakuten": "楽天", "amazon": "Amazon", **MANUAL_MALLS}
 MALLS_LIKE_RAKUTEN = {"mercari"}  # 楽天と同じ商品を出品している想定のモール（止める一覧を楽天の出品で絞る）
+TODO_STOPPED = {"yahoo"}  # 在庫連携をやめたモール（止める一覧を作らない。注文ファイルを置けば楽天・Amazon の在庫0はする）
 MAX_RETRY = 5
 SKU_RE = re.compile(r"(?<![0-9A-Za-z])(\d{6}(?:[A-Za-z]{2}\d{6}|[A-Za-z]\d{7}))(?![0-9A-Za-z])")
 SKU_COLUMNS = ("商品管理コード", "商品番号", "SKU", "sku", "SKUコード", "管理番号", "商品管理番号", "商品コード",
@@ -497,6 +502,8 @@ def write_todo(state, now, dry, upload_malls=()):
     TODO_DIR.mkdir(exist_ok=True)
     catalog = rakuten_catalog()
     for mall, label in MANUAL_MALLS.items():
+        if mall in TODO_STOPPED:
+            continue
         if mall in upload_malls:
             new = [e for e in state["ledger"].values() if mall in e["todo"] and e["todo"][mall] is None]
             if not dry:
@@ -546,6 +553,7 @@ def write_todo(state, now, dry, upload_malls=()):
 
 
 MERCARI_PRODUCTS_DIR = INBOX / "mercari_products"
+REFERENCE_DIR = TODO_DIR / "参考"
 MERCARI_SKU_COL = re.compile(r"^SKU(\d+)_(ID|商品管理コード|現在の在庫数)$")
 
 
@@ -638,47 +646,76 @@ def write_mercari_upload(state, now, dry, loaded=None):
             continue
         pid, skus = hit
         target = next(s for s in skus if norm(s[3]) == k)
+        if target[0] != 1:
+            # 在庫更新ファイルは SKU1 の5項目だけで作るため、SKU2 以降の商品は手作業
+            log.error(f"メルカリ: {k} は商品 {pid} の SKU{target[0]} のため、在庫更新ファイルに入れられません（手作業で0にしてください）")
+            if not dry:
+                e["mercari_upload"] = {"status": "multi_sku", "export": export_name}
+            continue
         if not target[2]:
             zero += 1
             if not dry:
                 e["mercari_upload"] = {"status": "zero", "export": export_name}
             continue
-        rows.append((k, pid, skus, target))
+        rows.append((k, [pid, target[1], str(target[2]), "2", str(target[2])]))  # 2: マイナス、現在の在庫数だけ減らして 0 にする
     log.info(f"メルカリの在庫更新: 対象 {len(rows)}件 / メルカリの商品CSVに無い {absent}件 / すでに在庫0 {zero}件")
     if not dry:
-        # 商品CSVに無かったSKU（メルカリに出品が無い・CSVの出力範囲外）の一覧。手作業で確認する用
+        # 商品CSVに無かったSKU（メルカリに出品が無い・CSVの出力範囲外）の参考一覧
         missing = sorted(((k, e) for k, e in state["ledger"].items()
                           if (e.get("mercari_upload") or {}).get("status") == "absent"), key=lambda x: x[1]["at"])
-        TODO_DIR.mkdir(exist_ok=True)
-        with open(TODO_DIR / "メルカリ_商品CSVに無い.csv", "w", newline="", encoding="cp932", errors="replace") as f:
+        REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(REFERENCE_DIR / "メルカリ_商品CSVに無い.csv", "w", newline="", encoding="cp932", errors="replace") as f:
             w = csv.writer(f, lineterminator="\r\n")
             w.writerow(["商品番号", "売れたモール", "注文番号", "検知日時"])
             for k, e in missing:
                 w.writerow([k, MALL_LABEL[e["src"]], e["order"], e["at"][:16].replace("T", " ")])
     if not rows or dry:
         return
-    max_n = max(s[0] for _, _, skus, _ in rows for s in skus)
-    header = ["商品ID"]
-    for n in range(1, max_n + 1):
-        header += [f"SKU{n}_ID", f"SKU{n}_現在の在庫数", f"SKU{n}_増減フラグ", f"SKU{n}_在庫増減数"]
+    path, total = write_mercari_upload_file(now, enc, [line for _, line in rows])
+    for k, _ in rows:
+        state["ledger"][k]["mercari_upload"] = {"status": "file", "file": path.name, "at": now.isoformat(), "export": export_name}
+    log.info(f"メルカリのアップロード用ファイルを作成: {path.name}（今回の新規 {len(rows)}件 / 残っていたファイルと合わせて {total}件）")
+
+
+MERCARI_UPLOAD_HEADER = ["商品ID", "SKU1_ID", "SKU1_現在の在庫数", "SKU1_増減フラグ", "SKU1_在庫増減数"]
+
+
+def write_mercari_upload_file(now, enc, new_lines):
+    """todo/ 直下に未アップロードの在庫更新ファイルが残っていれば、その行と新しい行を1つのファイルにまとめる。
+    （アップロード済みのファイルは todo/Uploaded/ へ移す運用。サブフォルダの中は見ない）
+    使用中などで動かせない古いファイルは結合しない（同じ行が2つのファイルに入らないようにするため）。"""
+    leftovers = []
+    for old in sorted(TODO_DIR.glob("メルカリ_在庫更新_アップロード_*.csv")):
+        tmp = old.with_suffix(".merging")
+        try:
+            old.rename(tmp)
+        except OSError:
+            log.warning(f"{old.name} を開いているなどで動かせないため、今回は結合しません")
+            continue
+        leftovers.append(tmp)
+    lines, seen = [], set()
+    for tmp in leftovers:
+        with open(tmp, "r", encoding=enc, errors="replace", newline="") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            for row in reader:
+                if len(row) >= 5 and row[1] and row[1] not in seen:
+                    seen.add(row[1])
+                    lines.append(row[:5])
+    for line in new_lines:
+        if line[1] not in seen:
+            seen.add(line[1])
+            lines.append(line)
     path = TODO_DIR / f"メルカリ_在庫更新_アップロード_{now:%Y%m%d_%H%M}.csv"
-    TODO_DIR.mkdir(exist_ok=True)
     with open(path, "w", newline="", encoding=enc, errors="replace") as f:
         w = csv.writer(f, lineterminator="\r\n")
-        w.writerow(header)
-        for k, pid, skus, target in rows:
-            line = [pid] + [""] * (4 * max_n)
-            for n, sku_id, stock, code in skus:
-                base = 1 + 4 * (n - 1)
-                line[base] = sku_id
-                line[base + 1] = "" if stock is None else str(stock)
-                if n == target[0]:
-                    line[base + 2] = "2"           # 2: マイナス
-                    line[base + 3] = str(stock)    # 現在の在庫数だけ減らして 0 にする
-            w.writerow(line)
-    for k, pid, skus, target in rows:
-        state["ledger"][k]["mercari_upload"] = {"status": "file", "file": path.name, "at": now.isoformat(), "export": export_name}
-    log.info(f"メルカリのアップロード用ファイルを作成: {path.name}（{len(rows)}件）")
+        w.writerow(MERCARI_UPLOAD_HEADER)
+        w.writerows(lines)
+    for tmp in leftovers:
+        tmp.unlink(missing_ok=True)
+    if leftovers:
+        log.info(f"残っていた在庫更新ファイル {len(leftovers)}つを結合しました")
+    return path, len(lines)
 
 
 def ws_export(state):

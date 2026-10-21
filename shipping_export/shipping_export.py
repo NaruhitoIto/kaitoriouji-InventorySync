@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -71,6 +72,20 @@ mercari_mall = メルカリ
 yahoo_mall = ヤフオク店
 ; 楽天の発送待ち注文を何日前までさかのぼって探すか（最大62）
 rakuten_days = 30
+; 画面の「注文日がこの日時以降」の初期値（何日前か）。出荷済みリストで除外するので広めでよい
+default_days = 14
+; ヤフオク店の注文番号の頭に付ける文字（ワサビの注文番号は「ストアID-注文番号」）
+yahoo_order_prefix = vivoage-
+
+[AMAZON_SP_API]
+; Amazon の注文がキャンセル・発送済みでないかを確認するためのキー（空なら確認しない）
+client_id =
+client_secret =
+refresh_token =
+marketplace_id = A1VC38T7YXB528
+endpoint = https://sellingpartnerapi-fe.amazon.com
+; 既存の設定ファイル（[AMAZON_SP_API] がある ini）を使う場合はそのパス。キーが空のときだけ使う
+config_file =
 """
 
 
@@ -91,7 +106,24 @@ def load_config():
         if o.has_section("RAKUTEN_API"):
             secret, key = o["RAKUTEN_API"].get("service_secret", "").strip(), o["RAKUTEN_API"].get("license_key", "").strip()
     out = Path(s.get("output_dir", "出荷データ"))
+    amz = {k: "" for k in ("client_id", "client_secret", "refresh_token")}
+    a = c["AMAZON_SP_API"] if c.has_section("AMAZON_SP_API") else {}
+    amz.update({k: a.get(k, "").strip() for k in amz})
+    amz["marketplace_id"] = a.get("marketplace_id", "A1VC38T7YXB528").strip() or "A1VC38T7YXB528"
+    amz["endpoint"] = (a.get("endpoint", "") or "https://sellingpartnerapi-fe.amazon.com").strip().rstrip("/")
+    other = a.get("config_file", "").strip() if a else ""
+    if not all(amz[k] for k in ("client_id", "client_secret", "refresh_token")) and other and Path(other).exists():
+        o = configparser.ConfigParser()
+        o.read(other, encoding="utf-8")
+        if o.has_section("AMAZON_SP_API"):
+            for k in ("client_id", "client_secret", "refresh_token", "marketplace_id", "endpoint"):
+                v = o["AMAZON_SP_API"].get(k, "").strip()
+                if v and "ここに" not in v:
+                    amz[k] = v.rstrip("/") if k == "endpoint" else v
     return {
+        "amazon": amz if all(amz[k] for k in ("client_id", "client_secret", "refresh_token")) else None,
+        "default_days": int(s.get("default_days", "14") or 14),
+        "yahoo_prefix": s.get("yahoo_order_prefix", "vivoage-"),
         "rakuten_secret": secret, "rakuten_key": key,
         "output_dir": out if out.is_absolute() else APP_DIR / out,
         "status": s.get("status", "本日発送分"), "carrier": s.get("carrier", "日本郵便"),
@@ -102,9 +134,11 @@ def load_config():
 
 
 def load_history():
-    if HISTORY_FILE.exists():
-        return json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-    return {"since": "", "orders": {}}
+    """出力履歴。orders = {"モール:注文番号": 出力日時}、skus = {商品コード: {mall, order, ordered, at}}"""
+    h = json.loads(HISTORY_FILE.read_text(encoding="utf-8")) if HISTORY_FILE.exists() else {}
+    h.setdefault("orders", {})
+    h.setdefault("skus", {})
+    return h
 
 
 def save_history(h):
@@ -334,7 +368,7 @@ def read_amazon(cfg, rows, log, since):
 def read_mercari(cfg, rows, log, since):
     orders, no_addr = {}, []
     for r in rows:
-        oid = r.get("order_id", "").strip()
+        oid = re.sub(r"^order_", "", r.get("order_id", "").strip())  # ワサビの注文番号は order_ を付けない
         if not oid or before(r.get("purchase_date"), since):
             continue
         if not (r.get("shipping_postal_code", "").strip() and r.get("shipping_address_1", "").strip()):
@@ -390,7 +424,8 @@ def read_yahoo(cfg, rows, log, since):
             unpaid.add(oid)  # 未入金は出荷しない
             continue
         if oid not in orders:
-            o = new_order(cfg["mall"]["yahoo"], r.get("YahooAuctionId", "").strip() or oid, parse_dt(r.get("OrderTime")))
+            # ワサビの注文番号は「ストアID-注文番号」（例 vivoage-10215030）
+            o = new_order(cfg["mall"]["yahoo"], f"{cfg['yahoo_prefix']}{oid}", parse_dt(r.get("OrderTime")))
             set_buyer(o, r.get("BillName", ""), r.get("BillNameKana", ""), r.get("BillMailAddress", ""), r.get("BillPrefecture", ""),
                       r.get("BillZipCode", ""), r.get("BillCity", ""), join(r.get("BillAddress1"), r.get("BillAddress2")),
                       r.get("BillPhoneNumber", ""))
@@ -426,6 +461,51 @@ def read_yahoo(cfg, rows, log, since):
 
 READERS = {"amazon": read_amazon, "mercari": read_mercari, "yahoo": read_yahoo}
 MALL_JA = {"rakuten": "楽天", "amazon": "Amazon", "mercari": "メルカリ", "yahoo": "ヤフオク"}
+MALL_PRIORITY = {"amazon": 0, "rakuten": 1, "mercari": 2, "yahoo": 3}  # 同時刻の重複ではキャンセルの影響が大きいモールを優先して発送
+
+
+def is_shipped_list(header):
+    """ピッキングリスト（出荷済みの注文番号リスト。end-order.csv）かどうか。"""
+    return "注文番号" in header and "発送日" in header and "商品コード" not in header
+
+
+def read_shipped(rows):
+    return {r.get("注文番号", "").strip() for r in rows if r.get("注文番号", "").strip() not in ("", "注文番号")}
+
+
+# ---------------------------------------------------------------- Amazon（キャンセル・発送済みの確認）
+
+def amazon_open_orders(cfg, created_after, log):
+    """Amazon の「未発送（Unshipped / PartiallyShipped）」の自己発送注文の注文番号を返す。確認できなければ None。"""
+    a = cfg["amazon"]
+    if not a:
+        log("Amazon: API のキーが無いため、キャンセル・発送済みの確認はしません（未出荷の注文レポートを使ってください）")
+        return None
+    t = requests.post("https://api.amazon.com/auth/o2/token", timeout=60, data={
+        "grant_type": "refresh_token", "refresh_token": a["refresh_token"],
+        "client_id": a["client_id"], "client_secret": a["client_secret"]})
+    if t.status_code != 200:
+        log(f"Amazon: 認証に失敗したため、キャンセルの確認はしません（HTTP {t.status_code}）")
+        return None
+    h = {"x-amz-access-token": t.json()["access_token"], "Accept": "application/json"}
+    params = {"MarketplaceIds": a["marketplace_id"], "OrderStatuses": "Unshipped,PartiallyShipped",
+              "FulfillmentChannels": "MFN", "MaxResultsPerPage": 100,
+              "CreatedAfter": (created_after - timedelta(minutes=5)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    found = set()
+    while True:
+        for attempt in range(8):
+            r = requests.get(f"{a['endpoint']}/orders/v0/orders", headers=h, params=params, timeout=60)
+            if r.status_code not in (429, 500, 503):
+                break
+            time.sleep(min(60, 5 * (attempt + 1)))  # 注文の一覧は呼び出し回数の制限が厳しい
+        if r.status_code != 200:
+            log(f"Amazon: 注文の確認に失敗したため、キャンセルの確認はしません（HTTP {r.status_code}）")
+            return None
+        pl = r.json().get("payload", {})
+        found.update(o["AmazonOrderId"] for o in pl.get("Orders", []))
+        if not pl.get("NextToken"):
+            return found
+        params = {"MarketplaceIds": a["marketplace_id"], "NextToken": pl["NextToken"]}
 
 
 # ---------------------------------------------------------------- 出力
@@ -437,28 +517,63 @@ def q(v):
     return s
 
 
-def write_csv(cfg, orders):
+def write_csv(cfg, orders, name):
     cfg["output_dir"].mkdir(parents=True, exist_ok=True)
-    path = cfg["output_dir"] / f"order-{datetime.now(JST):%Y%m%d%H%M%S}.csv"
+    path = cfg["output_dir"] / name
     lines = [",".join(q(h) for h in HEADER)]
     for o in orders:
-        for name, code, price, qty in o["items"]:
+        for item_name, code, price, qty in o["items"]:
             row = dict(o["head"])
             row.update({"ステータス": cfg["status"], "お届け先：配送業者": cfg["carrier"],
-                        "商品名": name, "商品コード": code, "商品金額": price, "商品数": qty})
+                        "商品名": item_name, "商品コード": code, "商品金額": price, "商品数": qty})
             lines.append(",".join(q(row[h]) for h in HEADER))
     path.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
     return path
 
 
-def create(cfg, since, files, use_rakuten, skip_done, log):
-    """注文を集めて出荷データを作る。戻り値は作ったファイル（無ければ None）。"""
+def find_duplicates(out, history):
+    """同じ商品コードが複数の注文（または前回までに出力した注文）にあるものを探す。
+    先に注文された方を「発送」、それ以外を「キャンセル候補」とする。戻り値は (アラート行, キャンセル候補の注文キー集合)。"""
+    by_sku = {}
+    for key, mall, o in out:
+        for _, code, _, _ in o["items"]:
+            if code:
+                by_sku.setdefault(code.upper(), {})[key] = (key, mall, o)  # 同じ注文の重複は1つにする
+    alerts, losers = [], set()
+    order_key = lambda x: (x[2]["ordered"] or datetime.max.replace(tzinfo=JST), MALL_PRIORITY.get(x[1], 9))
+    for sku, found in by_sku.items():
+        lst = sorted(found.values(), key=order_key)
+        prev = history["skus"].get(sku)
+        if prev and prev["order"] not in found:
+            # 前回までに出荷データに出した注文と同じ商品（すでに出荷済みのはず）
+            alerts.append([sku, "発送（出力済み）", prev["mall"], prev["order"].split(":", 1)[-1], prev.get("ordered", ""),
+                           "前回までに出荷データに出力済み"])
+            for k, m, o in lst:
+                alerts.append([sku, "キャンセル候補", MALL_JA[m], o["head"]["注文番号"], o["head"]["受注日"], "前回出力した注文と同じ商品"])
+                losers.add(k)
+            continue
+        if len(lst) < 2:
+            continue
+        win = lst[0]
+        alerts.append([sku, "発送", MALL_JA[win[1]], win[2]["head"]["注文番号"], win[2]["head"]["受注日"], "先に注文された方"])
+        for k, m, o in lst[1:]:
+            alerts.append([sku, "キャンセル候補", MALL_JA[m], o["head"]["注文番号"], o["head"]["受注日"], "後から注文された方"])
+            losers.add(k)
+    return alerts, losers
+
+
+def create(cfg, since, files, use_rakuten, skip_done, hold_dupes, log):
+    """注文を集めて出荷データを作る。戻り値は (作ったファイル or None, 重複アラート行)。"""
     history = load_history()
-    collected = []
-    if use_rakuten:
-        collected += [("rakuten", o) for o in fetch_rakuten(cfg, since, log)]
+    collected, shipped, shipped_files = [], set(), 0
     for f in files:
         header, rows = read_table(f)
+        if is_shipped_list(header):
+            got = read_shipped(rows)
+            shipped |= got
+            shipped_files += 1
+            log(f"出荷済みリスト: {Path(f).name} から注文番号 {len(got):,}件")
+            continue
         mall = detect_mall(header)
         if not mall:
             log(f"× {Path(f).name}: どのモールの注文ファイルか分かりません（先頭の列: {', '.join(header[:6])}）")
@@ -466,8 +581,12 @@ def create(cfg, since, files, use_rakuten, skip_done, log):
         got = READERS[mall](cfg, rows, log, since)
         log(f"{MALL_JA[mall]}: {Path(f).name} から注文 {len(got)}件（{since:%m/%d %H:%M} 以降）")
         collected += [(mall, o) for o in got]
+    if use_rakuten:
+        collected += [("rakuten", o) for o in fetch_rakuten(cfg, since, log)]
+    if not shipped_files:
+        log("※ 出荷済みリスト（ピッキングリストの end-order.csv）が追加されていません。出荷済みの注文も出力されるおそれがあります")
 
-    out, old, done, seen = [], 0, 0, set()
+    out, old, done, in_list, seen = [], 0, 0, 0, set()
     for mall, o in collected:
         key = f"{mall}:{o['head']['注文番号']}"
         if key in seen:
@@ -475,29 +594,62 @@ def create(cfg, since, files, use_rakuten, skip_done, log):
         seen.add(key)
         if o["ordered"] and o["ordered"] < since:
             old += 1
-            continue
-        if skip_done and key in history["orders"]:
+        elif o["head"]["注文番号"] in shipped:
+            in_list += 1
+        elif skip_done and key in history["orders"]:
             done += 1
-            continue
-        out.append((key, o))
-    log(f"対象の注文: {len(out)}件（{since:%m/%d %H:%M} より前で除外 {old}件 / 出力済みで除外 {done}件）")
-    history["since"] = since.strftime("%Y-%m-%d %H:%M")
+        else:
+            out.append((key, mall, o))
+    log(f"候補の注文: {len(out)}件（除外: 出荷済みリストにあり {in_list}件 / 出力済み {done}件 / {since:%m/%d %H:%M} より前 {old}件）")
+
+    amz = [o for _, m, o in out if m == "amazon" and o["ordered"]]
+    if amz:
+        open_ids = amazon_open_orders(cfg, min(o["ordered"] for o in amz), log)
+        if open_ids is not None:
+            closed = {k for k, m, o in out if m == "amazon" and o["head"]["注文番号"] not in open_ids}
+            out = [x for x in out if x[0] not in closed]
+            log(f"Amazon: キャンセル・発送済み・保留中の注文 {len(closed)}件を除外しました"
+                + (f"（例: {', '.join(sorted(k.split(':', 1)[1] for k in closed)[:5])}）" if closed else ""))
+
+    alerts, losers = find_duplicates(out, history)
+    stamp = datetime.now(JST)
+    held = []
+    if losers and hold_dupes:
+        held = [x for x in out if x[0] in losers]
+        out = [x for x in out if x[0] not in losers]
+    if alerts:
+        cfg["output_dir"].mkdir(parents=True, exist_ok=True)
+        apath = cfg["output_dir"] / f"重複SKU_アラート_{stamp:%Y%m%d%H%M%S}.csv"
+        with open(apath, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["商品コード", "判定", "モール", "注文番号", "受注日", "理由"])
+            w.writerows(alerts)
+        log(f"！ 同じ商品の重複注文: {len({a[0] for a in alerts})}商品（一覧: {apath.name}）")
+        for a in alerts[:30]:
+            log(f"   {a[0]}  {a[1]}  {a[2]} {a[3]}  {a[4]}")
+    if held:
+        hpath = write_csv(cfg, [o for _, _, o in held], f"重複注文_要確認_{stamp:%Y%m%d%H%M%S}.csv")
+        log(f"！ キャンセル候補の注文 {len(held)}件は出荷データに入れず {hpath.name} に出しました（キャンセルするか確認してください）")
+
     if not out:
         save_history(history)
         log("出力する注文はありません。")
-        return None
-    out.sort(key=lambda x: (x[1]["ordered"] or datetime.min.replace(tzinfo=JST)))
-    path = write_csv(cfg, [o for _, o in out])
-    stamp = datetime.now(JST).isoformat(timespec="seconds")
-    for key, _ in out:
-        history["orders"][key] = stamp
+        return None, alerts
+    out.sort(key=lambda x: (x[2]["ordered"] or datetime.min.replace(tzinfo=JST)))
+    path = write_csv(cfg, [o for _, _, o in out], f"order-{stamp:%Y%m%d%H%M%S}.csv")
+    iso = stamp.isoformat(timespec="seconds")
+    for key, mall, o in out:
+        history["orders"][key] = iso
+        for _, code, _, _ in o["items"]:
+            if code:
+                history["skus"][code.upper()] = {"mall": MALL_JA[mall], "order": key, "ordered": o["head"]["受注日"], "at": iso}
     save_history(history)
     by = {}
-    for key, o in out:
-        by[key.split(":")[0]] = by.get(key.split(":")[0], 0) + 1
-    log(f"作成しました: {path.name}（注文 {len(out)}件 / 行数 {sum(len(o['items']) for _, o in out)}）  "
+    for _, mall, _ in out:
+        by[mall] = by.get(mall, 0) + 1
+    log(f"作成しました: {path.name}（注文 {len(out)}件 / 行数 {sum(len(o['items']) for _, _, o in out)}）  "
         + " / ".join(f"{MALL_JA[m]} {n}件" for m, n in by.items()))
-    return path
+    return path, alerts
 
 
 # ---------------------------------------------------------------- 画面
@@ -515,16 +667,19 @@ def main_gui():
 
     frm = tk.Frame(root, padx=10, pady=8)
     frm.pack(fill="x")
-    tk.Label(frm, text="この日時以降の注文を対象にする（例 2026-10-21 23:00）").grid(row=0, column=0, sticky="w")
-    since_var = tk.StringVar(value=history.get("since", ""))
+    tk.Label(frm, text="注文日がこの日時以降の注文を対象（出荷済みリストで除外するので広めでよい）").grid(row=0, column=0, sticky="w")
+    since_var = tk.StringVar(value=(datetime.now(JST) - timedelta(days=cfg["default_days"])).strftime("%Y-%m-%d 00:00"))
     tk.Entry(frm, textvariable=since_var, width=20).grid(row=0, column=1, sticky="w", padx=6)
 
     rak_var = tk.BooleanVar(value=bool(cfg["rakuten_secret"] and cfg["rakuten_key"]))
     tk.Checkbutton(frm, text="楽天の発送待ち注文を API で取得する", variable=rak_var).grid(row=1, column=0, columnspan=2, sticky="w")
     skip_var = tk.BooleanVar(value=True)
     tk.Checkbutton(frm, text="出力済みの注文は除く（二重出荷を防ぐ）", variable=skip_var).grid(row=2, column=0, columnspan=2, sticky="w")
+    hold_var = tk.BooleanVar(value=True)
+    tk.Checkbutton(frm, text="同じ商品の重複注文は、先に注文された方だけ出力する（後の方は「重複注文_要確認」に出す）",
+                   variable=hold_var).grid(row=3, column=0, columnspan=2, sticky="w")
 
-    tk.Label(root, text="注文ファイル（Amazon の注文レポート・メルカリ・ヤフオクの注文CSV）", padx=10).pack(anchor="w")
+    tk.Label(root, text="ファイル（出荷済みリスト end-order.csv、Amazon の注文レポート、メルカリ・ヤフオクの注文CSV）", padx=10).pack(anchor="w")
     lst = tk.Listbox(root, height=6)
     lst.pack(fill="x", padx=10)
 
@@ -534,7 +689,8 @@ def main_gui():
                 header, _ = read_table(f)
                 mall = detect_mall(header)
                 files.append(f)
-                lst.insert("end", f"[{MALL_JA.get(mall, '不明')}] {f}")
+                label = "出荷済みリスト" if is_shipped_list(header) else MALL_JA.get(mall, "不明")
+                lst.insert("end", f"[{label}] {f}")
 
     def remove_files():
         for i in reversed(lst.curselection()):
@@ -573,7 +729,14 @@ def main_gui():
 
         def work():
             try:
-                path = create(cfg, since, list(files), rak_var.get(), skip_var.get(), log)
+                path, alerts = create(cfg, since, list(files), rak_var.get(), skip_var.get(), hold_var.get(), log)
+                if alerts:
+                    skus = len({a[0] for a in alerts})
+                    lines = "\n".join(f"{a[0]}  {a[1]}: {a[2]} {a[3]}" for a in alerts[:12])
+                    more = "\n…（続きは出力フォルダの「重複SKU_アラート」を確認）" if len(alerts) > 12 else ""
+                    root.after(0, lambda: messagebox.showwarning(
+                        APP_NAME, f"同じ商品が複数の注文に入っています（{skus}商品）。\n"
+                                  f"「発送」の注文を出荷し、「キャンセル候補」の注文はキャンセルを検討してください。\n\n{lines}{more}"))
                 if path:
                     root.after(0, lambda: messagebox.showinfo(APP_NAME, f"出荷データを作成しました。\n{path}"))
             except Exception as e:

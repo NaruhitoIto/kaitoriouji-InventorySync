@@ -634,6 +634,16 @@ def write_mercari_upload(state, now, dry):
             continue
         rows.append((k, pid, skus, target))
     log.info(f"メルカリの在庫更新: 対象 {len(rows)}件 / メルカリの商品CSVに無い {absent}件 / すでに在庫0 {zero}件")
+    if not dry:
+        # 商品CSVに無かったSKU（メルカリに出品が無い・CSVの出力範囲外）の一覧。手作業で確認する用
+        missing = sorted(((k, e) for k, e in state["ledger"].items()
+                          if (e.get("mercari_upload") or {}).get("status") == "absent"), key=lambda x: x[1]["at"])
+        TODO_DIR.mkdir(exist_ok=True)
+        with open(TODO_DIR / "メルカリ_商品CSVに無い.csv", "w", newline="", encoding="cp932", errors="replace") as f:
+            w = csv.writer(f, lineterminator="\r\n")
+            w.writerow(["商品番号", "売れたモール", "注文番号", "検知日時"])
+            for k, e in missing:
+                w.writerow([k, MALL_LABEL[e["src"]], e["order"], e["at"][:16].replace("T", " ")])
     if not rows or dry:
         return
     max_n = max(s[0] for _, _, skus, _ in rows for s in skus)

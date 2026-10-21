@@ -538,15 +538,9 @@ MERCARI_PRODUCTS_DIR = INBOX / "mercari_products"
 MERCARI_SKU_COL = re.compile(r"^SKU(\d+)_(ID|商品管理コード|現在の在庫数)$")
 
 
-def load_mercari_products():
-    """inbox/mercari_products/ の最新の商品CSV（メルカリShopsの一括編集用ダウンロード）を読み、
-    {商品管理コード(大文字): (商品ID, [(SKU番号, SKU_ID, 現在の在庫数, 商品管理コード), ...])} と、ファイル名・文字コードを返す。"""
-    MERCARI_PRODUCTS_DIR.mkdir(parents=True, exist_ok=True)
-    files = sorted((p for p in MERCARI_PRODUCTS_DIR.iterdir() if p.is_file() and p.suffix.lower() in (".csv", ".txt")),
-                   key=lambda p: p.stat().st_mtime)
-    if not files:
-        return None, None, None
-    path = files[-1]
+def read_mercari_product_file(path, products):
+    """メルカリShopsの商品CSV 1ファイルを読み、products に {商品管理コード(大文字): (商品ID, [(SKU番号, SKU_ID, 現在の在庫数, 商品管理コード), ...])} を追加する。
+    戻り値は (文字コード, 読んだ商品数)。形式が違うときは (None, 0)。"""
     raw = path.read_bytes()
     enc = "utf-8-sig" if raw.startswith(b"\xef\xbb\xbf") else "utf-8"
     try:
@@ -557,7 +551,7 @@ def load_mercari_products():
     header = [h.strip() for h in next(rows, [])]
     if "商品ID" not in header:
         log.error(f"{path.name} に「商品ID」列がありません。見出し: {header[:15]}")
-        return None, None, None
+        return None, 0
     i_pid = header.index("商品ID")
     sku_cols = {}
     for i, h in enumerate(header):
@@ -566,8 +560,8 @@ def load_mercari_products():
             sku_cols.setdefault(int(m.group(1)), {})[m.group(2)] = i
     if not any("商品管理コード" in c and "ID" in c for c in sku_cols.values()):
         log.error(f"{path.name} に「SKU1_ID」「SKU1_商品管理コード」列が見つかりません。見出し: {header[:40]}")
-        return None, None, None
-    products = {}
+        return None, 0
+    count = 0
     for row in rows:
         if len(row) <= i_pid or not row[i_pid].strip():
             continue
@@ -583,11 +577,34 @@ def load_mercari_products():
         for n, sku_id, stock, code in skus:
             if code:
                 products[norm(code)] = (row[i_pid].strip(), skus)
-    age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
-    log.info(f"メルカリの商品CSV {path.name} を読みました（商品管理コード {len(products):,}件 / {age.total_seconds() / 3600:.1f}時間前のファイル）")
+        count += 1
+    return enc, count
+
+
+def load_mercari_products():
+    """inbox/mercari_products/ の商品CSV（メルカリShopsの一括編集用ダウンロード。複数ファイルに分けてよい）をすべて読み、
+    {商品管理コード(大文字): (商品ID, [...])} と、ファイル群の識別名・文字コードを返す。"""
+    MERCARI_PRODUCTS_DIR.mkdir(parents=True, exist_ok=True)
+    files = sorted((p for p in MERCARI_PRODUCTS_DIR.iterdir() if p.is_file() and p.suffix.lower() in (".csv", ".txt")),
+                   key=lambda p: p.stat().st_mtime)
+    if not files:
+        return None, None, None
+    products, encs, rows = {}, set(), 0
+    for path in files:
+        enc, count = read_mercari_product_file(path, products)
+        if enc:
+            encs.add(enc)
+            rows += count
+    if not encs:
+        return None, None, None
+    newest = datetime.fromtimestamp(files[-1].stat().st_mtime)
+    age = datetime.now() - newest
+    log.info(f"メルカリの商品CSV {len(files)}ファイルを読みました（商品 {rows:,}行 / 商品管理コード {len(products):,}件 / "
+             f"最新ファイルは{age.total_seconds() / 3600:.1f}時間前）")
     if age > timedelta(hours=6):
         log.warning("メルカリの商品CSVが6時間以上前のものです。現在の在庫数が古いとアップロードでエラーになることがあります")
-    return products, path.name, enc
+    enc = "cp932" if "cp932" in encs else sorted(encs)[0]
+    return products, f"{len(files)}files_{newest:%Y%m%d%H%M%S}", enc
 
 
 def write_mercari_upload(state, now, dry):

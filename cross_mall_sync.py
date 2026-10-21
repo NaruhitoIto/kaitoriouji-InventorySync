@@ -61,6 +61,7 @@ RAKUTEN_CANCEL = {"700", "800", "900"}
 AUTO_TARGETS = ("rakuten", "amazon")  # API で自動的に0にするモール
 MANUAL_MALLS = {"mercari": "メルカリ", "yahoo": "ヤフオク"}  # 手動で止めるモール（一覧を作る）
 MALL_LABEL = {"rakuten": "楽天", "amazon": "Amazon", **MANUAL_MALLS}
+MALLS_LIKE_RAKUTEN = {"mercari"}  # 楽天と同じ商品を出品している想定のモール（止める一覧を楽天の出品で絞る）
 MAX_RETRY = 5
 SKU_RE = re.compile(r"(?<![0-9A-Za-z])(\d{6}(?:[A-Za-z]{2}\d{6}|[A-Za-z]\d{7}))(?![0-9A-Za-z])")
 SKU_COLUMNS = ("商品管理コード", "商品番号", "SKU", "sku", "SKUコード", "管理番号", "商品管理番号", "商品コード",
@@ -439,11 +440,73 @@ def push_amazon(state, acfg, dry, validate):
              f"FBAのみで対象外 {counts.get('fba', 0)}件 / 失敗 {counts.get('error', 0)}件")
 
 
+def rakuten_catalog():
+    """楽天に出品がある商品番号（小文字）の集合。WS連携の送信状態ファイルのキーを使う（読むだけ）。"""
+    return set(json.loads(ws.STATE_FILE.read_text(encoding="utf-8"))) if ws.STATE_FILE.exists() else None
+
+
+AMAZON_VERIFY_AFTER = timedelta(minutes=30)  # Amazon は受付後の反映が遅いことがあるため、この時間がたってから確認する
+AMAZON_RESEND_MAX = 3
+
+
+def verify_amazon(state, acfg, now, dry):
+    """在庫0を送ってから一定時間たったSKUについて、Amazon の在庫が本当に0になったかを確かめ、
+    まだ在庫があれば送り直す。確認できたものは "verified" を記録して以後は見ない。"""
+    due = [k for k, e in state["ledger"].items()
+           if str(e["push"].get("amazon", "")).startswith("20") and not e.get("verified", {}).get("amazon")
+           and now - datetime.fromisoformat(e["push"]["amazon"]) >= AMAZON_VERIFY_AFTER]
+    if not due:
+        return
+    ok, resent, gave_up = 0, [], []
+    for k in due:
+        e = state["ledger"][k]
+        try:
+            li = sp_request(acfg, "GET", f"/listings/2021-08-01/items/{acfg['seller_id']}/{quote(k, safe='')}",
+                            params={"marketplaceIds": acfg["marketplace_id"], "includedData": "fulfillmentAvailability"})
+        except RuntimeError as ex:
+            if "HTTP 404" in str(ex):
+                e.setdefault("verified", {})["amazon"] = "absent"
+            continue
+        qty = [f.get("quantity") or 0 for f in li.get("fulfillmentAvailability") or [] if f.get("fulfillmentChannelCode") == "DEFAULT"]
+        if not any(q > 0 for q in qty):
+            if not dry:
+                e.setdefault("verified", {})["amazon"] = now.isoformat()
+            ok += 1
+        elif e.get("resent", {}).get("amazon", 0) >= AMAZON_RESEND_MAX:
+            gave_up.append(k)
+        else:
+            if not dry:
+                res = amazon_zero(acfg, k, False)
+                e.setdefault("resent", {})["amazon"] = e.get("resent", {}).get("amazon", 0) + 1
+                e["push"]["amazon"] = now.isoformat() if res == "ok" else res
+            resent.append(k)
+        time.sleep(0.25)
+    log.info(f"Amazon の反映確認: 0を確認 {ok}件 / まだ在庫あり{'（dry-run のため再送しない）' if dry else '・再送'} {len(resent)}件"
+             f"（例: {', '.join(resent[:5])}）")
+    if gave_up:
+        log.error(f"Amazon で{AMAZON_RESEND_MAX}回送っても在庫が0にならないSKU: {len(gave_up)}件（セラーセントラルで手動確認してください）: "
+                  f"{', '.join(gave_up[:20])}")
+
+
 def write_todo(state, now, dry):
-    """メルカリ・ヤフオクで手動で止めるSKUの一覧（今回の新規分と累計）を Excel で開ける CSV で作る。"""
+    """メルカリ・ヤフオクで手動で止めるSKUの一覧（今回の新規分と累計）を Excel で開ける CSV で作る。
+    メルカリは楽天と同じ商品を出品している想定のため、楽天に出品が無いSKUは一覧に入れない。"""
     TODO_DIR.mkdir(exist_ok=True)
+    catalog = rakuten_catalog()
     for mall, label in MANUAL_MALLS.items():
-        rows = sorted(((k, e) for k, e in state["ledger"].items() if mall in e["todo"]), key=lambda x: x[1]["at"])
+        if mall in MALLS_LIKE_RAKUTEN and catalog is not None:
+            skipped = 0
+            for k, e in state["ledger"].items():
+                if mall in e["todo"] and k.lower() not in catalog:
+                    if e["todo"][mall] is None:
+                        skipped += 1
+                    if not dry:
+                        e["todo"][mall] = "楽天に無いため対象外"
+            if skipped:
+                log.info(f"{label}: 楽天に出品が無いSKU {skipped}件は一覧に入れません（{label}は楽天と同じ出品の想定）")
+        rows = sorted(((k, e) for k, e in state["ledger"].items() if mall in e["todo"]
+                       and not (mall in MALLS_LIKE_RAKUTEN and catalog is not None and k.lower() not in catalog)),
+                      key=lambda x: x[1]["at"])
         new = [(k, e) for k, e in rows if e["todo"][mall] is None]
         if dry:
             log.info(f"{label}で止める一覧: 今回の新規 {len(new)}件（確認モードのためファイルは作りません）")
@@ -618,6 +681,8 @@ def main():
         save_state(state)  # 取得した注文を先に保存（送信は未送信フラグで次回も再試行される）
 
     push_amazon(state, acfg, dry, validate)
+    if not validate:
+        verify_amazon(state, acfg, now, dry)
     push_rakuten(state, cfg, dry, validate)
     write_todo(state, now, dry or validate)
     write_mercari_upload(state, now, dry or validate)

@@ -23,6 +23,12 @@ WS の状態ファイル（wasabi_stock_state.json）は読むだけで変更し
   python cross_mall_sync.py                                               2回目以降（定期実行もこれ）
   python cross_mall_sync.py --validate    Amazon は検証モード（在庫は変わらない）、楽天は送らない
   python cross_mall_sync.py --ws-export   WS 復旧時に取り込ませる「売れたSKU」のCSVを作る（送信はしない）
+  python cross_mall_sync.py --mercari-upload   メルカリの在庫一括更新CSVだけを作る（注文は取得しない）
+
+メルカリShopsの在庫一括更新ファイル:
+  inbox/mercari_products/ にメルカリShopsの商品CSV（一括編集用ダウンロード）を置くと、毎回の実行で
+  todo/メルカリ_在庫更新_アップロード_*.csv（商品ID, SKU1_ID, SKU1_現在の在庫数, SKU1_増減フラグ=2, SKU1_在庫増減数）を作る。
+  一度ファイルに出したSKUは次から出さない（同じ商品を二重に減らさないため）。商品CSVは新しいものに置き換えてよい。
 """
 import base64
 import configparser
@@ -465,6 +471,115 @@ def write_todo(state, now, dry):
                 w.writerow(line(k, e))
 
 
+MERCARI_PRODUCTS_DIR = INBOX / "mercari_products"
+MERCARI_SKU_COL = re.compile(r"^SKU(\d+)_(ID|商品管理コード|現在の在庫数)$")
+
+
+def load_mercari_products():
+    """inbox/mercari_products/ の最新の商品CSV（メルカリShopsの一括編集用ダウンロード）を読み、
+    {商品管理コード(大文字): (商品ID, [(SKU番号, SKU_ID, 現在の在庫数, 商品管理コード), ...])} と、ファイル名・文字コードを返す。"""
+    MERCARI_PRODUCTS_DIR.mkdir(parents=True, exist_ok=True)
+    files = sorted((p for p in MERCARI_PRODUCTS_DIR.iterdir() if p.is_file() and p.suffix.lower() in (".csv", ".txt")),
+                   key=lambda p: p.stat().st_mtime)
+    if not files:
+        return None, None, None
+    path = files[-1]
+    raw = path.read_bytes()
+    enc = "utf-8-sig" if raw.startswith(b"\xef\xbb\xbf") else "utf-8"
+    try:
+        text = raw.decode(enc)
+    except UnicodeDecodeError:
+        enc, text = "cp932", raw.decode("cp932", errors="replace")
+    rows = csv.reader(io.StringIO(text))
+    header = [h.strip() for h in next(rows, [])]
+    if "商品ID" not in header:
+        log.error(f"{path.name} に「商品ID」列がありません。見出し: {header[:15]}")
+        return None, None, None
+    i_pid = header.index("商品ID")
+    sku_cols = {}
+    for i, h in enumerate(header):
+        m = MERCARI_SKU_COL.match(h)
+        if m:
+            sku_cols.setdefault(int(m.group(1)), {})[m.group(2)] = i
+    if not any("商品管理コード" in c and "ID" in c for c in sku_cols.values()):
+        log.error(f"{path.name} に「SKU1_ID」「SKU1_商品管理コード」列が見つかりません。見出し: {header[:40]}")
+        return None, None, None
+    products = {}
+    for row in rows:
+        if len(row) <= i_pid or not row[i_pid].strip():
+            continue
+        skus = []
+        for n in sorted(sku_cols):
+            c = sku_cols[n]
+            sku_id = row[c["ID"]].strip() if "ID" in c and len(row) > c["ID"] else ""
+            if not sku_id:
+                continue
+            code = row[c["商品管理コード"]].strip() if "商品管理コード" in c and len(row) > c["商品管理コード"] else ""
+            stock = ws.parse_stock(row[c["現在の在庫数"]]) if "現在の在庫数" in c and len(row) > c["現在の在庫数"] else None
+            skus.append((n, sku_id, stock, code))
+        for n, sku_id, stock, code in skus:
+            if code:
+                products[norm(code)] = (row[i_pid].strip(), skus)
+    age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
+    log.info(f"メルカリの商品CSV {path.name} を読みました（商品管理コード {len(products):,}件 / {age.total_seconds() / 3600:.1f}時間前のファイル）")
+    if age > timedelta(hours=6):
+        log.warning("メルカリの商品CSVが6時間以上前のものです。現在の在庫数が古いとアップロードでエラーになることがあります")
+    return products, path.name, enc
+
+
+def write_mercari_upload(state, now, dry):
+    """他モールで売れたSKUを、メルカリShopsの在庫一括更新CSV（増減フラグ=2:マイナス、在庫増減数=現在の在庫数）にする。
+    一度ファイルに出したSKUは二度と出さない（二重に減らさないため）。"""
+    products, export_name, enc = load_mercari_products()
+    if products is None:
+        log.info("メルカリのアップロード用ファイル: inbox/mercari_products/ に商品CSVが無いため作りません")
+        return
+    targets = [(k, e) for k, e in state["ledger"].items() if "mercari" in e["todo"]
+               and (not e.get("mercari_upload") or (e["mercari_upload"].get("status") in ("absent", "zero")
+                                                    and e["mercari_upload"].get("export") != export_name))]
+    rows, absent, zero = [], 0, 0
+    for k, e in sorted(targets, key=lambda x: x[1]["at"]):
+        hit = products.get(k)
+        if not hit:
+            absent += 1
+            if not dry:
+                e["mercari_upload"] = {"status": "absent", "export": export_name}
+            continue
+        pid, skus = hit
+        target = next(s for s in skus if norm(s[3]) == k)
+        if not target[2]:
+            zero += 1
+            if not dry:
+                e["mercari_upload"] = {"status": "zero", "export": export_name}
+            continue
+        rows.append((k, pid, skus, target))
+    log.info(f"メルカリの在庫更新: 対象 {len(rows)}件 / メルカリの商品CSVに無い {absent}件 / すでに在庫0 {zero}件")
+    if not rows or dry:
+        return
+    max_n = max(s[0] for _, _, skus, _ in rows for s in skus)
+    header = ["商品ID"]
+    for n in range(1, max_n + 1):
+        header += [f"SKU{n}_ID", f"SKU{n}_現在の在庫数", f"SKU{n}_増減フラグ", f"SKU{n}_在庫増減数"]
+    path = TODO_DIR / f"メルカリ_在庫更新_アップロード_{now:%Y%m%d_%H%M}.csv"
+    TODO_DIR.mkdir(exist_ok=True)
+    with open(path, "w", newline="", encoding=enc, errors="replace") as f:
+        w = csv.writer(f, lineterminator="\r\n")
+        w.writerow(header)
+        for k, pid, skus, target in rows:
+            line = [pid] + [""] * (4 * max_n)
+            for n, sku_id, stock, code in skus:
+                base = 1 + 4 * (n - 1)
+                line[base] = sku_id
+                line[base + 1] = "" if stock is None else str(stock)
+                if n == target[0]:
+                    line[base + 2] = "2"           # 2: マイナス
+                    line[base + 3] = str(stock)    # 現在の在庫数だけ減らして 0 にする
+            w.writerow(line)
+    for k, pid, skus, target in rows:
+        state["ledger"][k]["mercari_upload"] = {"status": "file", "file": path.name, "at": now.isoformat(), "export": export_name}
+    log.info(f"メルカリのアップロード用ファイルを作成: {path.name}（{len(rows)}件）")
+
+
 def ws_export(state):
     """WS 復旧時に、停止中に売れたSKUを WS へ取り込ませるCSV（rakuten_orders_sync.py と同じ形式）を作る。"""
     path = ws.OUT_DIR / f"wasabi_stock_停止中に売れた分_{datetime.now():%Y%m%d_%H%M%S}.csv"
@@ -485,6 +600,12 @@ def main():
     if "--ws-export" in args:
         ws_export(state)
         return
+    if "--mercari-upload" in args:
+        # 注文の取得はせず、台帳からメルカリのアップロード用ファイルだけ作る
+        write_mercari_upload(state, datetime.now(JST), dry)
+        if not dry:
+            save_state(state)
+        return
     now = datetime.now(JST)
     log.info(f"モード: {'dry-run' if dry else '検証' if validate else '送信'} / 対象: {state['since']} 以降の注文 / 台帳 {len(state['ledger'])}件")
 
@@ -499,6 +620,7 @@ def main():
     push_amazon(state, acfg, dry, validate)
     push_rakuten(state, cfg, dry, validate)
     write_todo(state, now, dry or validate)
+    write_mercari_upload(state, now, dry or validate)
     if not dry and not validate:
         save_state(state)
 

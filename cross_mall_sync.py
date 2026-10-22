@@ -70,7 +70,9 @@ SKIP_SOURCES = {"yahoo_store": {"yahoo"}}
 MANUAL_MALLS = {"mercari": "メルカリ", "yahoo": "ヤフオク"}  # 手動で止めるモール（一覧を作る）
 MALL_LABEL = {"rakuten": "楽天", "amazon": "Amazon", "yahoo_store": "ヤフーのストア", **MANUAL_MALLS}
 MALLS_LIKE_RAKUTEN = {"mercari"}  # 楽天と同じ商品を出品している想定のモール（止める一覧を楽天の出品で絞る）
-TODO_STOPPED = {"yahoo"}  # 在庫連携をやめたモール（止める一覧を作らない。注文ファイルを置けば楽天・Amazon の在庫0はする）
+TODO_STOPPED = {"yahoo", "mercari"}  # 止める一覧・アップロード用ファイルを作らないモール
+# （ヤフオクは在庫連携をやめた。メルカリはワサビの連携が再開した。注文ファイルを置けば他モールの在庫0はする）
+MERCARI_UPLOAD = False  # メルカリの在庫更新アップロード用ファイルを作るか（ワサビ停止中だけ True にする）
 MAX_RETRY = 5
 SKU_RE = re.compile(r"(?<![0-9A-Za-z])(\d{6}(?:[A-Za-z]{2}\d{6}|[A-Za-z]\d{7}))(?![0-9A-Za-z])")
 SKU_COLUMNS = ("商品管理コード", "商品番号", "SKU", "sku", "SKUコード", "管理番号", "商品管理番号", "商品コード",
@@ -832,9 +834,12 @@ def main():
         verify_amazon(state, acfg, now, dry)
     push_rakuten(state, cfg, dry, validate)
     push_yahoo_store(state, dry, validate)
-    mercari_list = load_mercari_products()  # メルカリの在庫ありリスト（あればメルカリはアップロード用ファイルで対応）
-    write_todo(state, now, dry or validate, upload_malls={"mercari"} if mercari_list[0] is not None else set())
-    write_mercari_upload(state, now, dry or validate, mercari_list)
+    if MERCARI_UPLOAD:
+        mercari_list = load_mercari_products()  # メルカリの在庫ありリスト（あればメルカリはアップロード用ファイルで対応）
+        write_todo(state, now, dry or validate, upload_malls={"mercari"} if mercari_list[0] is not None else set())
+        write_mercari_upload(state, now, dry or validate, mercari_list)
+    else:
+        write_todo(state, now, dry or validate)
     if not dry and not validate:
         save_state(state)
 

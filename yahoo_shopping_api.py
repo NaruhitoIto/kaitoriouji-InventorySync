@@ -15,6 +15,7 @@ import base64
 import configparser
 import json
 import os
+import re
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -29,11 +30,30 @@ HOSTS = {"production": "https://circus.shopping.yahooapis.jp", "test": "https://
 
 # ---------------------------------------------------------------- 設定・トークン
 
+PUBLIC_KEY_FILE = BASE_DIR / "yahoo_public_key.pem"
+PEM_BLOCK = re.compile(r"-----BEGIN PUBLIC KEY-----.*?-----END PUBLIC KEY-----", re.S)
+
+
+def _config_text():
+    """設定ファイルの中身を返す。public_key_file に公開鍵の中身（複数行）を直接貼った場合は、
+    それを yahoo_public_key.pem に書き出し、設定上はそのファイル名として扱う（設定ファイル自体は書き換えない）。"""
+    text = CONFIG_FILE.read_text(encoding="utf-8-sig")
+    m = PEM_BLOCK.search(text)
+    if m:
+        body = re.sub(r"-----(BEGIN|END) PUBLIC KEY-----|\s", "", m.group(0))
+        pem = ("-----BEGIN PUBLIC KEY-----\n" + "\n".join(body[i:i + 64] for i in range(0, len(body), 64))
+               + "\n-----END PUBLIC KEY-----\n")
+        if not PUBLIC_KEY_FILE.exists() or PUBLIC_KEY_FILE.read_text(encoding="ascii") != pem:
+            PUBLIC_KEY_FILE.write_text(pem, encoding="ascii", newline="\n")
+        text = text[:m.start()] + PUBLIC_KEY_FILE.name + text[m.end():]
+    return text
+
+
 def load_config(env=None):
     if not CONFIG_FILE.exists():
         raise SystemExit(f"設定ファイルがありません: {CONFIG_FILE}（yahoo_shopping_config.ini.sample をコピーして作成してください）")
     c = configparser.ConfigParser()
-    c.read(CONFIG_FILE, encoding="utf-8")
+    c.read_string(_config_text())
     section = "YAHOO_SHOPPING_TEST" if env == "test" and c.has_section("YAHOO_SHOPPING_TEST") else "YAHOO_SHOPPING"
     s = c[section]
     cfg = {k: s.get(k, "").strip() for k in ("client_id", "client_secret", "redirect_uri", "seller_id", "environment",

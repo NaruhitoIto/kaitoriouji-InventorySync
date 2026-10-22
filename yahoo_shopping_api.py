@@ -189,3 +189,38 @@ def get_stock(cfg, item_codes):
         if i + 1000 < len(item_codes):
             time.sleep(1)  # 1クエリー/秒
     return result
+
+
+def set_stock_zero(cfg, item_codes):
+    """在庫更新API で在庫を0にする。戻り値は {商品コード: None（成功） or エラーコード}。
+    1件でもエラーがあるとまとめて取り消されるため、まとめて失敗したら1件ずつ送り直す。"""
+    out = {}
+
+    def send(codes):
+        r = call(cfg, "setStock", data={"seller_id": cfg["seller_id"], "item_code": ",".join(codes),
+                                       "quantity": ",".join("0" for _ in codes)})
+        if r.status_code not in (200, 207):
+            code, msg = error_of(r)
+            return {c: f"HTTP{r.status_code} {code}" for c in codes}
+        res = {}
+        root = ET.fromstring(r.content)
+        for x in root.iter("Result"):
+            ic, sub = x.findtext("ItemCode") or "", x.findtext("SubCode") or ""
+            key = f"{ic}:{sub}" if sub else ic
+            err = x.findtext("ErrorCode")
+            res[key] = err if err else (None if (x.findtext("Quantity") or "") == "0" else f"Quantity={x.findtext('Quantity')}")
+        for c in codes:  # 応答に無いものは失敗扱い
+            res.setdefault(c, "応答なし")
+        return res
+
+    for i in range(0, len(item_codes), 100):
+        batch = item_codes[i:i + 100]
+        res = send(batch)
+        if any(v for v in res.values()) and len(batch) > 1:
+            res = {}
+            for c in batch:
+                time.sleep(1)  # 1クエリー/秒
+                res.update(send([c]))
+        out.update(res)
+        time.sleep(1)
+    return out

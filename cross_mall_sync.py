@@ -2,8 +2,8 @@
 """
 ワサビスイッチ(WS)停止中の代替: WS を通さず、モール間で直接「売れた商品の在庫を0」にする。
 
-  楽天の注文（RMS API）              → Amazon の在庫を0（Listings API）
-  Amazonの注文（SP-API）             → 楽天の在庫を0（RMS 在庫CSV を SFTP）
+  楽天の注文（RMS API）              → Amazon・ヤフーのストアの在庫を0（Listings API / 在庫更新API）
+  Amazonの注文（SP-API）             → 楽天・ヤフーのストアの在庫を0（RMS 在庫CSV を SFTP / 在庫更新API）
   メルカリ・ヤフオクの注文（手動ファイル）→ 楽天・Amazon の在庫を0
   どこかで売れたSKU                  → メルカリ・ヤフオクで手動で止める一覧（todo/）を作る
 
@@ -64,9 +64,11 @@ RAKUTEN_CFG = BASE_DIR / "rakuten_api_config.ini"
 OVERLAP = timedelta(minutes=10)      # 取得期間を前回と少し重ねる（注文番号で重複は除く）
 AMAZON_ACTIVE = "Pending,Unshipped,PartiallyShipped,Shipped"
 RAKUTEN_CANCEL = {"700", "800", "900"}
-AUTO_TARGETS = ("rakuten", "amazon")  # API で自動的に0にするモール
+AUTO_TARGETS = ("rakuten", "amazon", "yahoo_store")  # API で自動的に0にするモール
+# 送り先ごとに「この売れたモールなら送らない」（ヤフーのストアで売れた分はヤフー側で在庫が減る）
+SKIP_SOURCES = {"yahoo_store": {"yahoo"}}
 MANUAL_MALLS = {"mercari": "メルカリ", "yahoo": "ヤフオク"}  # 手動で止めるモール（一覧を作る）
-MALL_LABEL = {"rakuten": "楽天", "amazon": "Amazon", **MANUAL_MALLS}
+MALL_LABEL = {"rakuten": "楽天", "amazon": "Amazon", "yahoo_store": "ヤフーのストア", **MANUAL_MALLS}
 MALLS_LIKE_RAKUTEN = {"mercari"}  # 楽天と同じ商品を出品している想定のモール（止める一覧を楽天の出品で絞る）
 TODO_STOPPED = {"yahoo"}  # 在庫連携をやめたモール（止める一覧を作らない。注文ファイルを置けば楽天・Amazon の在庫0はする）
 MAX_RETRY = 5
@@ -159,7 +161,7 @@ def add_sold(state, sku, src, order_id, at):
         return False
     entry = {"src": src, "order": order_id, "at": at, "push": {}, "tries": {}, "todo": {}}
     for t in AUTO_TARGETS:
-        if t != src:
+        if t != src and src not in SKIP_SOURCES.get(t, ()):
             entry["push"][t] = None  # None = 未送信
     for m in MANUAL_MALLS:
         if m != src:
@@ -394,6 +396,73 @@ def pending(state, target):
     return [k for k, e in state["ledger"].items()
             if target in e["push"] and (e["push"][target] is None or str(e["push"][target]).startswith("error"))
             and e["tries"].get(target, 0) < MAX_RETRY]
+
+
+def backfill_targets(state):
+    """送り先を後から追加したとき、既存の台帳にもその送り先を「未送信」として加える。"""
+    added = 0
+    for e in state["ledger"].values():
+        for t in AUTO_TARGETS:
+            if t not in e["push"] and t != e["src"] and e["src"] not in SKIP_SOURCES.get(t, ()):
+                e["push"][t] = None
+                added += 1
+    return added
+
+
+def push_yahoo_store(state, dry, validate):
+    """ヤフーのストア（Yahoo!ショッピング）で在庫0にする。在庫参照APIでストアにある・在庫が残っている商品だけを
+    在庫更新APIで0にする。ストアに無い商品は absent として以後は送らない。"""
+    todo = pending(state, "yahoo_store")
+    if not todo:
+        return
+    try:
+        import yahoo_shopping_api as yapi
+        ycfg = yapi.load_config()
+        stock = yapi.get_stock(ycfg, todo)
+    except SystemExit as e:
+        log.warning(f"ヤフーのストア: 在庫を確認できないため今回は送りません（{e}）")
+        return
+    except Exception as e:
+        log.error(f"ヤフーのストア: 在庫参照に失敗しました（次回再試行）: {e}")
+        return
+    absent, already, to_zero = [], [], []
+    for k in todo:
+        s = stock.get(k) or {}
+        if s.get("status") != "1":
+            absent.append(k)
+        elif s.get("quantity") == "0":
+            already.append(k)
+        else:
+            to_zero.append(k)
+    log.info(f"ヤフーのストア: 在庫0にする {len(to_zero)}件 / すでに0 {len(already)}件 / ストアに無い {len(absent)}件")
+    if dry or validate:
+        if to_zero:
+            log.info(f"  {'dry-run' if dry else '検証モード'}のためヤフーのストアへは送りません。例: {', '.join(to_zero[:10])}")
+        return
+    now = datetime.now(JST).isoformat()
+    for k in absent:
+        state["ledger"][k]["push"]["yahoo_store"] = "absent"
+    for k in already:
+        state["ledger"][k]["push"]["yahoo_store"] = now
+    if not to_zero:
+        return
+    try:
+        result = yapi.set_stock_zero(ycfg, to_zero)
+    except Exception as e:
+        log.error(f"ヤフーのストア: 在庫更新に失敗しました（次回再試行）: {e}")
+        return
+    failed = 0
+    for k in to_zero:
+        e = state["ledger"][k]
+        e["tries"]["yahoo_store"] = e["tries"].get("yahoo_store", 0) + 1
+        err = result.get(k, "応答なし")
+        if err is None:
+            e["push"]["yahoo_store"] = now
+        else:
+            e["push"]["yahoo_store"] = f"error:{err}"
+            failed += 1
+            log.error(f"ヤフーのストア 在庫0 失敗: {k} / {err}")
+    log.info(f"ヤフーのストア 結果: 成功 {len(to_zero) - failed}件 / 失敗 {failed}件")
 
 
 def push_rakuten(state, cfg, dry, validate):
@@ -749,6 +818,9 @@ def main():
 
     acfg = load_amazon_config()
     cfg = ws.load_configs()
+    added = backfill_targets(state)
+    if added:
+        log.info(f"既存の台帳に新しい送り先を追加: {added}件")
     collect_rakuten(state, now, dry)
     collect_amazon(state, acfg, now)
     collect_manual(state, now, dry)
@@ -759,6 +831,7 @@ def main():
     if not validate:
         verify_amazon(state, acfg, now, dry)
     push_rakuten(state, cfg, dry, validate)
+    push_yahoo_store(state, dry, validate)
     mercari_list = load_mercari_products()  # メルカリの在庫ありリスト（あればメルカリはアップロード用ファイルで対応）
     write_todo(state, now, dry or validate, upload_malls={"mercari"} if mercari_list[0] is not None else set())
     write_mercari_upload(state, now, dry or validate, mercari_list)

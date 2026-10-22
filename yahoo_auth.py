@@ -4,62 +4,28 @@ Yahoo!ショッピングAPIのアクセストークンを取得する（Yahoo! I
 
 使い方:
   1. yahoo_auth.bat をダブルクリックする（ブラウザでログイン画面が開く）
+     テスト環境の設定（[YAHOO_SHOPPING_TEST]）でログインするときは python yahoo_auth.py test
   2. Yahoo! JAPAN ID でログインし、「同意」を押す
   3. コールバックURL（ストアのページ）が開いたら、アドレス欄のURLを全部コピーし、黒い画面に貼り付けて Enter
-  → yahoo_shopping_token.json に保存される（.gitignore 済み。チャットやGitHubに貼らないこと）
+  → yahoo_shopping_token_<environment>.json に保存される（.gitignore 済み。チャットやGitHubに貼らないこと）
 
 キーは yahoo_shopping_config.ini（yahoo_shopping_config.ini.sample をコピーして作る）から読む。
 """
-import configparser
-import json
 import secrets
-import time
+import sys
 import webbrowser
-from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
-BASE_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = BASE_DIR / "yahoo_shopping_config.ini"
-TOKEN_FILE = BASE_DIR / "yahoo_shopping_token.json"
+from yahoo_shopping_api import TOKEN_URL, load_config, save_token
+
 AUTH_URL = "https://auth.login.yahoo.co.jp/yconnect/v2/authorization"
-TOKEN_URL = "https://auth.login.yahoo.co.jp/yconnect/v2/token"
-
-
-def load_config():
-    if not CONFIG_FILE.exists():
-        raise SystemExit(f"設定ファイルがありません: {CONFIG_FILE}（yahoo_shopping_config.ini.sample をコピーして作成してください）")
-    c = configparser.ConfigParser()
-    c.read(CONFIG_FILE, encoding="utf-8")
-    s = c["YAHOO_SHOPPING"]
-    cfg = {k: s.get(k, "").strip() for k in ("client_id", "client_secret", "redirect_uri", "seller_id", "environment")}
-    for k in ("client_id", "client_secret", "redirect_uri"):
-        if not cfg[k] or "ここに" in cfg[k]:
-            raise SystemExit(f"yahoo_shopping_config.ini の {k} が未入力です")
-    return cfg
-
-
-def save_token(tok):
-    tok["obtained_at"] = int(time.time())
-    TOKEN_FILE.write_text(json.dumps(tok, ensure_ascii=False, indent=1), encoding="utf-8")
-
-
-def refresh(cfg):
-    """保存済みのリフレッシュトークンでアクセストークンを更新する。成功なら新しいトークン情報を返す。"""
-    old = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
-    r = requests.post(TOKEN_URL, timeout=60, auth=(cfg["client_id"], cfg["client_secret"]),
-                      data={"grant_type": "refresh_token", "refresh_token": old["refresh_token"]})
-    if r.status_code != 200:
-        raise RuntimeError(f"トークンの更新に失敗しました（HTTP {r.status_code}）。yahoo_auth.bat でログインし直してください")
-    tok = r.json()
-    tok.setdefault("refresh_token", old["refresh_token"])
-    save_token(tok)
-    return tok
 
 
 def main():
-    cfg = load_config()
+    cfg = load_config("test" if "test" in sys.argv[1:] else None)
+    print(f"環境: {cfg['environment']} / ストアアカウント: {cfg['seller_id']}")
     state, nonce = secrets.token_urlsafe(16), secrets.token_urlsafe(16)
     url = AUTH_URL + "?" + urlencode({"response_type": "code", "client_id": cfg["client_id"], "redirect_uri": cfg["redirect_uri"],
                                       "scope": "openid profile", "state": state, "nonce": nonce})
@@ -87,10 +53,10 @@ def main():
             err = {"error": r.text[:200]}
         raise SystemExit(f"トークンの取得に失敗しました（HTTP {r.status_code}）: {err.get('error')} {err.get('error_description', '')}")
     tok = r.json()
-    save_token(tok)
+    save_token(cfg, tok)
     print()
-    print(f"トークンを保存しました: {TOKEN_FILE.name}（アクセストークンの有効期限 {int(tok.get('expires_in', 0)) // 60}分。"
-          f"リフレッシュトークンで更新できます）")
+    print(f"トークンを保存しました: {cfg['token_file'].name}（アクセストークンの有効期限 {int(tok.get('expires_in', 0)) // 60}分。"
+          f"以後はリフレッシュトークンで自動更新します）")
 
 
 if __name__ == "__main__":

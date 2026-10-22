@@ -64,4 +64,5 @@ shipping_export/出力履歴.json
 
 # Yahoo!ショッピング API
 yahoo_shopping_config.ini
-yahoo_shopping_token.json
+yahoo_shopping_token*.json
+yahoo_public_key.pem

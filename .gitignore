@@ -61,3 +61,7 @@ shipping_export/shipping_export.ini
 shipping_export/出荷データ/
 shipping_export/出力履歴.json
 出荷データ作成/
+
+# Yahoo!ショッピング API
+yahoo_shopping_config.ini
+yahoo_shopping_token.json

@@ -1,0 +1,15 @@
+; このファイルを yahoo_shopping_config.ini という名前でコピーして値を入れてください。
+; yahoo_shopping_config.ini は .gitignore 済みです（チャットやGitHubには絶対に貼らないでください）。
+[YAHOO_SHOPPING]
+; アプリケーションの管理ページで確認できる Client ID とシークレット
+client_id = ここにClient ID
+client_secret = ここにシークレット
+; Client ID に登録したコールバックURL（認可後にこのURLへ戻る。アドレス欄の code= を使う）
+redirect_uri = ここにコールバックURL
+; テスト環境のストアアカウント（snbx-… の形。設定完了メールに記載）
+seller_id = ここにストアアカウント
+; test（テスト環境）か production（本番）
+environment = test
+; 公開鍵認証を使う場合（任意）: ストアクリエイターPro > 設定 > 暗号鍵管理 で発行した公開鍵ファイルとバージョン
+public_key_file =
+public_key_version =

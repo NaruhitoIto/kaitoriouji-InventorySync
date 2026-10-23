@@ -9,6 +9,7 @@
   Amazon   : セラーセントラルの注文レポート（未出荷の注文）ファイル
   メルカリ : メルカリShopsの注文CSV（orders_*.csv）
   ヤフオク : ヤフオクの注文CSV（YahooAuctionId, OrderId, ... の形式）。入金済み（PayStatus=1）だけ出力
+  ヤフオク1: 個人アカウントの取引ナビのページの文字（Ctrl+A → Ctrl+C →「取引ナビを貼り付け」）。発送連絡の前の取引だけ
 
 ・注文ファイルは「注文ファイルを追加」で選ぶ（どのモールのファイルかは列名から自動で判定）
 ・「この日時以降の注文」より前の注文は出力しない
@@ -70,6 +71,8 @@ rakuten_mall = 楽天市場店
 amazon_mall = Amazon店
 mercari_mall = メルカリ
 yahoo_mall = ヤフオク店
+; 個人のヤフオクアカウント（取引ナビの貼り付け）
+auction_mall = ヤフオク1
 ; 楽天の発送待ち注文を何日前までさかのぼって探すか（最大62）
 rakuten_days = 30
 ; 画面の「注文日がこの日時以降」の初期値（何日前か）。出荷済みリストで除外するので広めでよい
@@ -85,6 +88,14 @@ refresh_token =
 marketplace_id = A1VC38T7YXB528
 endpoint = https://sellingpartnerapi-fe.amazon.com
 ; 既存の設定ファイル（[AMAZON_SP_API] がある ini）を使う場合はそのパス。キーが空のときだけ使う
+config_file =
+
+[WASABI]
+; ヤフオク店のまとめて取引の2つ目以降など、商品コードが分からない商品を、ワサビスイッチの商品名から探すためのトークン
+; （KEY:SECRET。空なら探さない）
+token =
+base_url = https://world-switch.com/kaitoriouji/ext
+; 既存の設定ファイル（[WASABI] がある wasabi_config.ini）を使う場合はそのパス。token が空のときだけ使う
 config_file =
 """
 
@@ -120,15 +131,27 @@ def load_config():
                 v = o["AMAZON_SP_API"].get(k, "").strip()
                 if v and "ここに" not in v:
                     amz[k] = v.rstrip("/") if k == "endpoint" else v
+    w = c["WASABI"] if c.has_section("WASABI") else {}
+    ws = {"token": w.get("token", "").strip(),
+          "base_url": (w.get("base_url", "") or "https://world-switch.com/kaitoriouji/ext").strip().rstrip("/")}
+    other = w.get("config_file", "").strip() if w else ""
+    if not ws["token"] and other and Path(other).exists():
+        o = configparser.ConfigParser()
+        o.read(other, encoding="utf-8")
+        if o.has_section("WASABI"):
+            ws["token"] = o["WASABI"].get("token", "").strip()
+            ws["base_url"] = (o["WASABI"].get("base_url", "") or ws["base_url"]).strip().rstrip("/")
     return {
         "amazon": amz if all(amz[k] for k in ("client_id", "client_secret", "refresh_token")) else None,
+        "wasabi": ws if ws["token"] and "ここに" not in ws["token"] else None,
         "default_days": int(s.get("default_days", "14") or 14),
         "yahoo_prefix": s.get("yahoo_order_prefix", "vivoage-"),
         "rakuten_secret": secret, "rakuten_key": key,
         "output_dir": out if out.is_absolute() else APP_DIR / out,
         "status": s.get("status", "本日発送分"), "carrier": s.get("carrier", "日本郵便"),
         "mall": {"rakuten": s.get("rakuten_mall", "楽天市場店"), "amazon": s.get("amazon_mall", "Amazon店"),
-                 "mercari": s.get("mercari_mall", "メルカリ"), "yahoo": s.get("yahoo_mall", "ヤフオク店")},
+                 "mercari": s.get("mercari_mall", "メルカリ"), "yahoo": s.get("yahoo_mall", "ヤフオク店"),
+                 "auction": s.get("auction_mall", "ヤフオク1")},
         "rakuten_days": min(int(s.get("rakuten_days", "30") or 30), 62),
     }
 
@@ -147,17 +170,20 @@ def save_history(h):
     tmp.replace(HISTORY_FILE)
 
 
-def read_table(path):
-    """CSV / TSV を文字コード（UTF-8 / Shift_JIS）と区切り文字を自動判定して [dict] で返す。"""
+def read_text(path):
+    """文字コード（UTF-8 / Shift_JIS）を自動判定してファイルの文字を返す。"""
     raw = Path(path).read_bytes()
     for enc in ("utf-8-sig", "cp932"):
         try:
-            text = raw.decode(enc)
-            break
+            return raw.decode(enc)
         except UnicodeDecodeError:
             continue
-    else:
-        text = raw.decode("cp932", errors="replace")
+    return raw.decode("cp932", errors="replace")
+
+
+def read_table(path):
+    """CSV / TSV を文字コード（UTF-8 / Shift_JIS）と区切り文字を自動判定して [dict] で返す。"""
+    text = read_text(path)
     first = text.split("\n", 1)[0]
     delim = "\t" if first.count("\t") > first.count(",") else ","
     rows = list(csv.reader(io.StringIO(text), delimiter=delim))
@@ -415,7 +441,7 @@ def line_values(v):
 
 
 def read_yahoo(cfg, rows, log, since):
-    orders, unpaid, no_sku = {}, set(), []
+    orders, unpaid = {}, set()
     for r in rows:
         oid = r.get("OrderId", "").strip()
         if not oid or before(r.get("OrderTime"), since):
@@ -446,22 +472,203 @@ def read_yahoo(cfg, rows, log, since):
             price = num(subs[i]) if i < len(subs) else 0
             if not sku:
                 # 複数商品の注文は商品コード（D列）が1つ目の分しか無い。タイトルに商品番号があれば使う
+                # （無ければ出荷データを作るときに fill_missing_skus でワサビの商品名から探す）
                 found = SKU_IN_TEXT.findall(title)
                 sku = found[-1].upper() if found else ""
-            if not sku:
-                no_sku.append(f"{oid}（{i + 1}つ目の商品）")
             o["items"].append((title, sku, price, 1))
             o["head"]["小計"] += price
     if unpaid:
         log(f"ヤフオク: 未入金の注文 {len(unpaid)}件は出力しません: {', '.join(sorted(unpaid)[:10])}")
-    if no_sku:
-        log(f"ヤフオク: 商品コードが無い明細 {len(no_sku)}件があります（そのまま出力。手作業で確認）: {', '.join(no_sku[:10])}")
     return list(orders.values())
 
 
+# ---------------------------------------------------------------- ワサビスイッチ（商品コードが分からない商品を商品名から探す）
+
+TITLE_CODE = re.compile(r"^([A-Za-z]\d{3}-(\d{4})-\d{2})(?=\s)")  # タイトル先頭の管理コード（例 m543-0011-15）
+
+
+def ws_search(ws, query):
+    """ワサビの商品検索。該当した商品番号のリストを返す。"""
+    r = requests.post(f"{ws['base_url']}/api/products/search", timeout=60, json={
+        "sort": "product_id", "reverse": False, "page": 1, "limit": 10, "query": query},
+        headers={"Authorization": f"Bearer {ws['token']}", "Content-Type": "application/json", "Accept": "application/json"})
+    time.sleep(0.4)  # 速度制限（約3リクエスト/秒）を守る
+    if r.status_code != 200:
+        raise RuntimeError(f"ワサビの商品検索 HTTP {r.status_code}")
+    return list(dict.fromkeys(str(d.get("商品番号") or "").strip() for d in r.json().get("data", []) if d.get("商品番号")))
+
+
+def ws_find_sku(ws, title):
+    """ヤフオクの商品タイトルからワサビの商品番号を探す。戻り値は (商品番号, 候補)。1件に決まらなければ商品番号は ""。
+    ワサビの「ヤフー｜商品名」がヤフオクのタイトルと同じ。本・CDなどは「表示用商品名」から【中古】を除いたものがタイトル。"""
+    title = title.strip()
+    m = TITLE_CODE.match(title)
+    tries = [{"ヤフー｜商品名": {"eq": title}}]
+    if m:
+        tries.append({"ヤフー｜商品名": {"starts": m.group(1)}})  # タイトルの空白などが少し違っても見つかるように
+    tries += [{"表示用商品名": {"eq": "【中古】" + title}}, {"表示用商品名": {"eq": title}}]
+    for q in tries:
+        found = ws_search(ws, q)
+        if m and len(found) > 1:
+            # 管理コードの真ん中の4桁は商品番号の末尾4桁
+            found = [s for s in found if s.endswith(m.group(2))] or found
+        if len(found) == 1:
+            return found[0], found
+        if found:
+            return "", found
+    return "", []
+
+
+def fill_missing_skus(cfg, orders, mall_ja, log):
+    """商品コードが空の明細を、ワサビの商品名から探して埋める。見つからない・候補が複数のものは空のまま出力する。"""
+    missing = [(o, i) for o in orders for i, it in enumerate(o["items"]) if not it[1]]
+    if not missing:
+        return
+    label = lambda o, i: f"{o['head']['注文番号']}（{i + 1}つ目「{o['items'][i][0][:20]}」）"
+    if not cfg["wasabi"]:
+        log(f"{mall_ja}: 商品コードが無い明細 {len(missing)}件（ワサビのトークンが未設定のため探していません。手作業で確認）: "
+            + ", ".join(label(o, i) for o, i in missing[:10]))
+        return
+    left, error = [], None
+    for o, i in missing:
+        title, _, price, qty = o["items"][i]
+        sku, cands = "", []
+        if not error:
+            try:
+                sku, cands = ws_find_sku(cfg["wasabi"], title)
+            except Exception as e:  # 通信エラーなど。出荷データの作成は止めない
+                error = e
+        if sku:
+            o["items"][i] = (title, sku, price, qty)
+        else:
+            left.append(label(o, i) + (f" 候補: {' / '.join(cands[:5])}" if cands else ""))
+    if error:
+        log(f"{mall_ja}: ワサビで商品コードを探す途中でエラーになりました（{type(error).__name__}: {str(error)[:80]}）")
+    log(f"{mall_ja}: 商品コードが無い明細 {len(missing)}件をワサビの商品名で探しました → 見つかった {len(missing) - len(left)}件"
+        + (f" / 見つからない・候補が複数 {len(left)}件（商品コードは空のまま出力。手作業で確認）" if left else ""))
+    for s in left[:20]:
+        log(f"   {s}")
+
+
+# ---------------------------------------------------------------- ヤフオク1（個人アカウントの取引ナビ）
+
+PREF = re.compile(r"北海道|東京都|(?:京都|大阪)府|.{2,3}県")
+NAVI_LABELS = {"氏名", "住所", "電話番号", "配送方法", "お支払い情報", "支払い方法"}
+NAVI_ITEM_LINE = re.compile(r"数量[：:]|落札価格[：:]|終了日時[：:]")
+NAVI_AUCTION_ID = re.compile(r"オークションID[：:]\s*([0-9A-Za-z]+)")
+
+
+def is_navi_text(text):
+    return bool(NAVI_AUCTION_ID.search(text or ""))
+
+
+def split_address(s):
+    """「和歌山県 日高郡日高町 大字志賀 3473-1」→ (都道府県, 市区郡, 残り)。取引ナビは空白で区切って表示する。
+    区切りが足りなければ都道府県だけ切り出し、残りは町名・番地に入れる。"""
+    s = re.sub(r"\s+", " ", s.replace("　", " ")).strip()
+    parts = s.split(" ", 2)
+    if len(parts) == 3 and PREF.fullmatch(parts[0]):
+        return parts[0], parts[1], parts[2]
+    m = PREF.match(s)
+    if not m:
+        return "", "", s
+    return m.group(0), "", s[m.end():].strip()
+
+
+def navi_ended(text, now):
+    """「終了日時：10月22日 20時10分」を日時にする。年は書かれていないので、未来の日付になるなら前年とする。"""
+    m = re.search(r"終了日時[：:]\s*(\d{1,2})月(\d{1,2})日\s*(\d{1,2})時(\d{1,2})分", text)
+    if not m:
+        return None
+    mo, d, h, mi = map(int, m.groups())
+    for year in (now.year, now.year - 1):
+        try:
+            dt = datetime(year, mo, d, h, mi, tzinfo=JST)
+        except ValueError:  # 2月29日など
+            continue
+        if dt <= now + timedelta(days=1):
+            return dt
+    return None
+
+
+def parse_navi(cfg, text, now=None):
+    """取引ナビのページの文字（Ctrl+A → Ctrl+C）から注文を作る。戻り値は (注文, None) か (None, 読めなかった理由)。
+    注文番号はオークションID（まとめて取引なら1つ目）。「発送連絡をする」がある（入金済み・未発送の）取引だけ受け付ける。"""
+    now = now or datetime.now(JST)
+    lines = [l.strip() for l in (text or "").replace("\r", "").split("\n")]
+    if not is_navi_text(text):
+        return None, "オークションIDが見つかりません。取引ナビのページで Ctrl+A → Ctrl+C してください"
+    if "発送連絡をする" not in text:
+        return None, "「発送連絡をする」がありません。未入金か、発送連絡済みの取引です"
+    start = next((i for i, l in enumerate(lines) if l.startswith("お届け情報")), None)
+    if start is None:
+        return None, "お届け情報がありません（匿名配送などでお届け先が出ていない取引は手作業で入力してください）"
+
+    def field(label):
+        """お届け情報より後で、ラベルの行の次から次のラベルまでの空でない行"""
+        i = next((i for i in range(start, len(lines)) if lines[i] == label), None)
+        vals = []
+        for l in lines[i + 1:] if i is not None else []:
+            if l in NAVI_LABELS or l.startswith("商品情報"):
+                break
+            if l:
+                vals.append(l)
+        return vals
+
+    name = (field("氏名") or [""])[0]
+    addr_lines = field("住所")
+    m = re.match(r"〒?\s*(\d{3})-?(\d{4})\s*(.*)$", addr_lines[0]) if addr_lines else None
+    if not name or not m:
+        return None, "お届け先の氏名・郵便番号を読み取れませんでした。手作業で入力してください"
+    zipc = m.group(1) + m.group(2)
+    pref, city, addr = split_address(" ".join([m.group(3)] + addr_lines[1:]))
+    if not pref or not addr:
+        return None, "お届け先の住所を読み取れませんでした。手作業で入力してください"
+    tel = (field("電話番号") or [""])[0]
+    fee = re.search(r"送料[：:]\s*([\d,]+)\s*円", " ".join(field("配送方法")))
+    pay = re.sub(r"[（(]受取明細[）)]", "", (field("支払い方法") or [""])[0]).strip()
+
+    pi = next((i for i in range(start, len(lines)) if lines[i].startswith("商品情報")), None)
+    items, block, aid, ended = [], [], "", None
+    for l in lines[pi + 1:] if pi is not None else []:
+        m = NAVI_AUCTION_ID.search(l)
+        if not m:
+            if l and l != "商品ページ":
+                block.append(l)
+            continue
+        # 商品名・数量・落札価格・終了日時のあとに「オークションID」が来る。まとめて取引ならこれが商品ごとに続く
+        btext = "\n".join(block)
+        titles = [b for b in block if not NAVI_ITEM_LINE.search(b)]
+        title = next((t for t in titles if SKU_IN_TEXT.search(t)), titles[0] if titles else "")
+        found = SKU_IN_TEXT.findall(title)
+        qty = re.search(r"数量[：:]\s*(\d+)", btext)
+        price = re.search(r"落札価格[：:]\s*([\d,]+)\s*円", btext)
+        if not price:
+            return None, f"落札価格を読み取れませんでした（オークションID {m.group(1)}）"
+        items.append((title, found[-1].upper() if found else "", num(price.group(1)), int(qty.group(1)) if qty else 1))
+        aid = aid or m.group(1)
+        ended = ended or navi_ended(btext, now)
+        block = []
+    if not items:
+        return None, "商品情報（商品名・落札価格・オークションID）を読み取れませんでした"
+    if not ended:
+        return None, "終了日時を読み取れませんでした"
+
+    o = new_order(cfg["mall"]["auction"], aid, ended)
+    set_buyer(o, name, "", "", pref, zipc, city, addr, tel)
+    set_dest(o, name, "", tel, pref, zipc, city, addr)
+    sub = sum(p * q for _, _, p, q in items)
+    ship = num(fee.group(1)) if fee else 0
+    o["items"] = items
+    o["head"].update({"お支払方法": pay, "入金日": fmt_day(ended), "小計": sub, "送料": ship,
+                      "合計": sub + ship, "請求合計": sub + ship})
+    return o, None
+
+
 READERS = {"amazon": read_amazon, "mercari": read_mercari, "yahoo": read_yahoo}
-MALL_JA = {"rakuten": "楽天", "amazon": "Amazon", "mercari": "メルカリ", "yahoo": "ヤフオク"}
-MALL_PRIORITY = {"amazon": 0, "rakuten": 1, "mercari": 2, "yahoo": 3}  # 同時刻の重複ではキャンセルの影響が大きいモールを優先して発送
+MALL_JA = {"rakuten": "楽天", "amazon": "Amazon", "mercari": "メルカリ", "yahoo": "ヤフオク", "auction": "ヤフオク1"}
+# 同時刻の重複ではキャンセルの影響が大きいモールを優先して発送
+MALL_PRIORITY = {"amazon": 0, "rakuten": 1, "mercari": 2, "yahoo": 3, "auction": 4}
 
 
 def is_shipped_list(header):
@@ -562,10 +769,14 @@ def find_duplicates(out, history):
     return alerts, losers
 
 
-def create(cfg, since, files, use_rakuten, skip_done, hold_dupes, log):
-    """注文を集めて出荷データを作る。戻り値は (作ったファイル or None, 重複アラート行)。"""
+def create(cfg, since, files, use_rakuten, skip_done, hold_dupes, log, navi=()):
+    """注文を集めて出荷データを作る。navi は取引ナビから読み取ったヤフオク1の注文。
+    戻り値は (作ったファイル or None, 重複アラート行)。"""
     history = load_history()
     collected, shipped, shipped_files = [], set(), 0
+    if navi:
+        log(f"ヤフオク1: 取引ナビから注文 {len(navi)}件")
+        collected += [("auction", o) for o in navi]
     for f in files:
         header, rows = read_table(f)
         if is_shipped_list(header):
@@ -592,7 +803,7 @@ def create(cfg, since, files, use_rakuten, skip_done, hold_dupes, log):
         if key in seen:
             continue
         seen.add(key)
-        if o["ordered"] and o["ordered"] < since:
+        if o["ordered"] and o["ordered"] < since and mall != "auction":  # 取引ナビは貼り付けた分をすべて対象にする
             old += 1
         elif o["head"]["注文番号"] in shipped:
             in_list += 1
@@ -610,6 +821,10 @@ def create(cfg, since, files, use_rakuten, skip_done, hold_dupes, log):
             out = [x for x in out if x[0] not in closed]
             log(f"Amazon: キャンセル・発送済み・保留中の注文 {len(closed)}件を除外しました"
                 + (f"（例: {', '.join(sorted(k.split(':', 1)[1] for k in closed)[:5])}）" if closed else ""))
+
+    # まとめて取引の2つ目以降など、商品コードが分からない商品をワサビで探す（重複チェックの前に）
+    for m in ("yahoo", "auction"):
+        fill_missing_skus(cfg, [o for _, mall, o in out if mall == m], MALL_JA[m], log)
 
     alerts, losers = find_duplicates(out, history)
     stamp = datetime.now(JST)
@@ -662,8 +877,8 @@ def main_gui():
     history = load_history()
     root = tk.Tk()
     root.title(APP_NAME)
-    root.geometry("760x560")
-    files = []
+    root.geometry("760x580")
+    files = []  # 一覧の行ごとに、注文ファイルのパスか、取引ナビから読み取ったヤフオク1の注文（dict）
 
     frm = tk.Frame(root, padx=10, pady=8)
     frm.pack(fill="x")
@@ -680,17 +895,47 @@ def main_gui():
                    variable=hold_var).grid(row=3, column=0, columnspan=2, sticky="w")
 
     tk.Label(root, text="ファイル（出荷済みリスト end-order.csv、Amazon の注文レポート、メルカリ・ヤフオクの注文CSV）", padx=10).pack(anchor="w")
+    tk.Label(root, text="ヤフオク1（個人）: 取引ナビのページで Ctrl+A → Ctrl+C してから「取引ナビを貼り付け」（1件ずつ）",
+             padx=10).pack(anchor="w")
     lst = tk.Listbox(root, height=6)
     lst.pack(fill="x", padx=10)
 
+    def add_navi(text, source):
+        o, err = parse_navi(cfg, text)
+        if err:
+            messagebox.showerror(APP_NAME, f"取引ナビを読み取れませんでした（{source}）。\n{err}")
+            return
+        aid = o["head"]["注文番号"]
+        if any(isinstance(f, dict) and f["head"]["注文番号"] == aid for f in files):
+            messagebox.showinfo(APP_NAME, f"オークションID {aid} はもう追加されています")
+            return
+        files.append(o)
+        codes = " ".join(code or "（商品コードなし）" for _, code, _, _ in o["items"])
+        lst.insert("end", f"[{cfg['mall']['auction']} 取引ナビ] {aid}  {codes}  {o['items'][0][0][:40]}")
+
     def add_files():
         for f in filedialog.askopenfilenames(title="注文ファイルを選ぶ", filetypes=[("注文ファイル", "*.csv *.txt *.tsv"), ("すべて", "*.*")]):
-            if f not in files:
-                header, _ = read_table(f)
-                mall = detect_mall(header)
-                files.append(f)
-                label = "出荷済みリスト" if is_shipped_list(header) else MALL_JA.get(mall, "不明")
-                lst.insert("end", f"[{label}] {f}")
+            if f in files:
+                continue
+            text = read_text(f)
+            if is_navi_text(text):  # 取引ナビの文字をテキストファイルに保存したもの
+                add_navi(text, Path(f).name)
+                continue
+            header, _ = read_table(f)
+            mall = detect_mall(header)
+            files.append(f)
+            label = "出荷済みリスト" if is_shipped_list(header) else MALL_JA.get(mall, "不明")
+            lst.insert("end", f"[{label}] {f}")
+
+    def paste_navi():
+        try:
+            text = root.clipboard_get()
+        except tk.TclError:
+            text = ""
+        if not text.strip():
+            messagebox.showerror(APP_NAME, "クリップボードが空です。取引ナビのページで Ctrl+A → Ctrl+C してから押してください")
+            return
+        add_navi(text, "クリップボード")
 
     def remove_files():
         for i in reversed(lst.curselection()):
@@ -700,7 +945,8 @@ def main_gui():
     bf = tk.Frame(root, padx=10, pady=4)
     bf.pack(fill="x")
     tk.Button(bf, text="注文ファイルを追加…", command=add_files).pack(side="left")
-    tk.Button(bf, text="選んだファイルを外す", command=remove_files).pack(side="left", padx=6)
+    tk.Button(bf, text="取引ナビを貼り付け", command=paste_navi).pack(side="left", padx=6)
+    tk.Button(bf, text="選んだものを外す", command=remove_files).pack(side="left")
     run_btn = tk.Button(bf, text="出荷データを作成", bg="#2d6cdf", fg="white", padx=12)
     run_btn.pack(side="right")
     tk.Button(bf, text="出力フォルダを開く", command=lambda: (cfg["output_dir"].mkdir(parents=True, exist_ok=True),
@@ -726,10 +972,12 @@ def main_gui():
             messagebox.showerror(APP_NAME, "楽天の取得にチェックを入れるか、注文ファイルを追加してください")
             return
         run_btn.configure(state="disabled")
+        paths = [f for f in files if isinstance(f, str)]
+        navi = [f for f in files if isinstance(f, dict)]
 
         def work():
             try:
-                path, alerts = create(cfg, since, list(files), rak_var.get(), skip_var.get(), hold_var.get(), log)
+                path, alerts = create(cfg, since, paths, rak_var.get(), skip_var.get(), hold_var.get(), log, navi)
                 if alerts:
                     skus = len({a[0] for a in alerts})
                     lines = "\n".join(f"{a[0]}  {a[1]}: {a[2]} {a[3]}" for a in alerts[:12])
@@ -753,6 +1001,8 @@ def main_gui():
     log(f"出力先: {cfg['output_dir']}")
     if not (cfg["rakuten_secret"] and cfg["rakuten_key"]):
         log("楽天の API キーが未設定です（shipping_export.ini）。楽天は取得しません")
+    if not cfg["wasabi"]:
+        log("ワサビのトークンが未設定です（shipping_export.ini の [WASABI]）。ヤフオクのまとめて取引の2つ目以降の商品コードは探しません")
     root.mainloop()
 
 

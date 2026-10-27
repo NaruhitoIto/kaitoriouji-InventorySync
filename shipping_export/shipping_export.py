@@ -1107,9 +1107,9 @@ SHIP_SALES_ITEMS = ("売上金額", "売上点数", "売上件数")
 RAKUTEN_CANCELLED = {"800", "900"}  # キャンセル確定待ち・キャンセル確定
 
 
-def rakuten_ship_sales(cfg, first, last, log):
-    """楽天の発送日ごとの売上 {日付: [売上金額, 売上点数, 売上件数]}。RMS の発送日で1日ずつ注文を検索する。
-    売上金額は商品代金＋送料（税込。goodsPrice + postagePrice）。キャンセルされた注文は除く。"""
+def rakuten_shipped_orders(cfg, first, last, log):
+    """発送日が first〜last の楽天の注文を [(発送日, 注文)] で返す。RMS の発送日で1日ずつ検索し、getOrder で中身を取る。
+    キャンセルされた注文は除く。"""
     h = rakuten_headers(cfg)
     ship_day, day = {}, first  # 注文番号 → 発送日（期間内で最初に見つかった日）
     while day <= last:
@@ -1133,7 +1133,7 @@ def rakuten_ship_sales(cfg, first, last, log):
             page += 1
         day += timedelta(days=1)
     log(f"売上集計: 楽天 発送日が期間内の注文 {len(ship_day):,}件。明細を取得します")
-    out, cancelled, numbers = {}, 0, list(ship_day)
+    out, cancelled, numbers = [], 0, list(ship_day)
     for i in range(0, len(numbers), 100):
         r = requests.post("https://api.rms.rakuten.co.jp/es/2.0/order/getOrder/", headers=h,
                           json={"orderNumberList": numbers[i:i + 100], "version": 7}, timeout=60)
@@ -1142,16 +1142,86 @@ def rakuten_ship_sales(cfg, first, last, log):
         for m in r.json().get("OrderModelList", []):
             if str(m.get("orderProgress")) in RAKUTEN_CANCELLED:
                 cancelled += 1
-                continue
-            s = out.setdefault(ship_day[m["orderNumber"]], [0, 0, 0])
-            s[0] += num(m.get("goodsPrice")) + num(m.get("postagePrice"))
-            s[1] += sum(num(it.get("units")) for p in m.get("PackageModelList") or [] for it in p.get("ItemModelList") or [])
-            s[2] += 1
+            else:
+                out.append((ship_day[m["orderNumber"]], m))
         if (i // 100 + 1) % 20 == 0:
             log(f"売上集計: 楽天 明細を取得中 {min(i + 100, len(numbers)):,}/{len(numbers):,}")
     if cancelled:
         log(f"売上集計: 楽天 キャンセルされた注文 {cancelled}件は除きました")
     return out
+
+
+def rakuten_items(m):
+    """楽天の注文の商品明細。"""
+    return [it for p in m.get("PackageModelList") or [] for it in p.get("ItemModelList") or []]
+
+
+def rakuten_ship_sales(cfg, first, last, log):
+    """楽天の発送日ごとの売上 {日付: [売上金額, 売上点数, 売上件数]}。
+    売上金額は商品代金＋送料（税込。goodsPrice + postagePrice）。"""
+    out = {}
+    for day, m in rakuten_shipped_orders(cfg, first, last, log):
+        s = out.setdefault(day, [0, 0, 0])
+        s[0] += num(m.get("goodsPrice")) + num(m.get("postagePrice"))
+        s[1] += sum(num(it.get("units")) for it in rakuten_items(m))
+        s[2] += 1
+    return out
+
+
+RAKUTEN_ITEM_HEADER = ["発送日", "注文番号", "商品番号", "商品管理番号", "商品名", "単価（税込）", "数量", "小計（税込）"]
+RAKUTEN_ITEM_SUMMARY = ["商品番号", "商品名", "売上点数", "売上金額（税込）", "売上件数", "最初の発送日", "最後の発送日"]
+
+
+def create_rakuten_item_sales(cfg, first, last, log):
+    """楽天の商品番号ごとの売上（発送日が first〜last）。明細（1行＝1商品）と商品番号ごとの合計の CSV を出す。
+    売上金額は商品の税込単価×数量。送料は注文単位で商品ごとに分けられないため含めない。
+    戻り値は (明細のファイル, 合計のファイル)。楽天のキーが無ければ (None, None)。"""
+    if not (cfg["rakuten_secret"] and cfg["rakuten_key"]):
+        log("売上集計: 楽天の API キーが無いため集計できません")
+        return None, None
+    lines, postage, zero = [], 0, 0
+    for day, m in rakuten_shipped_orders(cfg, first, last, log):
+        postage += num(m.get("postagePrice"))
+        for it in rakuten_items(m):
+            manage = str(it.get("manageNumber") or "").strip()
+            sku = str(it.get("itemNumber") or "").strip() or manage.upper()
+            price = num(it.get("priceTaxIncl") if it.get("priceTaxIncl") is not None else it.get("price"))
+            units = num(it.get("units"))
+            if units <= 0:  # 注文から外された商品（数量0）
+                zero += 1
+                continue
+            lines.append({"発送日": day.strftime("%Y-%m-%d"), "注文番号": m.get("orderNumber", ""), "商品番号": sku,
+                          "商品管理番号": manage, "商品名": it.get("itemName", ""), "単価（税込）": price, "数量": units,
+                          "小計（税込）": price * units})
+    lines.sort(key=lambda r: (r["発送日"], r["注文番号"]))
+    by = {}
+    for r in lines:
+        s = by.setdefault(r["商品番号"], {"商品番号": r["商品番号"], "商品名": r["商品名"], "売上点数": 0, "売上金額（税込）": 0,
+                                       "売上件数": set(), "最初の発送日": r["発送日"], "最後の発送日": r["発送日"]})
+        s["売上点数"] += r["数量"]
+        s["売上金額（税込）"] += r["小計（税込）"]
+        s["売上件数"].add(r["注文番号"])
+        s["最後の発送日"] = max(s["最後の発送日"], r["発送日"])
+    stamp = f"{first:%Y%m%d}-{last:%Y%m%d}_{datetime.now(JST):%Y%m%d%H%M%S}"
+    cfg["output_dir"].mkdir(parents=True, exist_ok=True)
+    detail = cfg["output_dir"] / f"売上明細_楽天_{stamp}.csv"
+    with open(detail, "w", newline="", encoding="utf-8-sig") as f:  # Excel でそのまま開けるように BOM 付き
+        w = csv.DictWriter(f, fieldnames=RAKUTEN_ITEM_HEADER)
+        w.writeheader()
+        w.writerows(lines)
+    summary = cfg["output_dir"] / f"売上集計_楽天_商品番号別_{stamp}.csv"
+    rows = [{**s, "売上件数": len(s["売上件数"])} for s in sorted(by.values(), key=lambda s: s["商品番号"])]
+    with open(summary, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=RAKUTEN_ITEM_SUMMARY)
+        w.writeheader()
+        w.writerows(rows)
+        w.writerow({"商品番号": "合計", "売上点数": sum(r["売上点数"] for r in rows),
+                    "売上金額（税込）": sum(r["売上金額（税込）"] for r in rows), "売上件数": len({r["注文番号"] for r in lines})})
+    log(f"売上集計: 楽天 商品番号 {len(rows):,}種類 / 売上点数 {sum(r['売上点数'] for r in rows):,}点 / "
+        f"売上金額 {sum(r['売上金額（税込）'] for r in rows):,}円（送料 {postage:,}円は含めていません）"
+        + (f" / 数量0の明細 {zero}行は除きました" if zero else ""))
+    log(f"売上集計を作成しました: {detail.name} / {summary.name}")
+    return detail, summary
 
 
 def amazon_ship_sales(cfg, first, last, log):
@@ -1262,7 +1332,7 @@ def main_gui():
     history = load_history()
     root = tk.Tk()
     root.title(APP_NAME)
-    root.geometry("860x610")
+    root.geometry("800x620")
     files = []  # 一覧の行ごとに、注文ファイルのパスか、取引ナビから読み取ったヤフオク1の注文（dict）
 
     frm = tk.Frame(root, padx=10, pady=8)
@@ -1281,12 +1351,16 @@ def main_gui():
     yesterday = (datetime.now(JST) - timedelta(days=1)).date()
     sf = tk.Frame(frm)
     sf.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
-    tk.Label(sf, text="売上集計（楽天・Amazon）の発送日").pack(side="left")
+    tk.Label(sf, text="売上集計の発送日").pack(side="left")
     ship_from_var = tk.StringVar(value=yesterday.replace(day=1).strftime("%Y-%m-%d"))
     ship_to_var = tk.StringVar(value=yesterday.strftime("%Y-%m-%d"))
     tk.Entry(sf, textvariable=ship_from_var, width=12).pack(side="left", padx=(6, 2))
     tk.Label(sf, text="〜").pack(side="left")
     tk.Entry(sf, textvariable=ship_to_var, width=12).pack(side="left", padx=2)
+    ship_btn = tk.Button(sf, text="日別（楽天・Amazon）", padx=8)
+    ship_btn.pack(side="left", padx=(10, 0))
+    item_btn = tk.Button(sf, text="商品番号別（楽天）", padx=8)
+    item_btn.pack(side="left", padx=6)
 
     tk.Label(root, text="ファイル（出荷済みリスト end-order.csv、Amazon の注文レポート、メルカリ・ヤフオクの注文CSV）", padx=10).pack(anchor="w")
     tk.Label(root, text="ヤフオク1（個人）: 取引ナビのページで Ctrl+A → Ctrl+C してから「取引ナビを貼り付け」（1件ずつ）",
@@ -1347,8 +1421,6 @@ def main_gui():
     run_btn.pack(side="right")
     sales_btn = tk.Button(bf, text="売上明細（ヤフオク店）", padx=8)
     sales_btn.pack(side="right", padx=6)
-    ship_btn = tk.Button(bf, text="売上集計（楽天・Amazon）", padx=8)
-    ship_btn.pack(side="right")
     tk.Button(bf, text="出力フォルダを開く", command=lambda: (cfg["output_dir"].mkdir(parents=True, exist_ok=True),
                                                          os.startfile(cfg["output_dir"]))).pack(side="right", padx=6)
 
@@ -1422,30 +1494,33 @@ def main_gui():
 
     sales_btn.configure(command=run_sales)
 
-    def run_ship_sales():
+    def run_ship_sales(btn, make):
+        """売上集計のボタン。make(cfg, 最初の日, 最後の日, log) はできたファイル（複数ならタプル）を返す。"""
         first, last = parse_dt(ship_from_var.get()), parse_dt(ship_to_var.get())
         if not first or not last or last < first:
             messagebox.showerror(APP_NAME, "売上集計の発送日を 2026-10-01 〜 2026-10-26 のように入力してください")
             return
-        ship_btn.configure(state="disabled")
+        btn.configure(state="disabled")
 
         def work():
             try:
-                path = create_ship_sales(cfg, first.date(), last.date(), log)
-                if path:
-                    root.after(0, lambda: messagebox.showinfo(APP_NAME, f"売上集計を作成しました。\n{path}"))
+                made = make(cfg, first.date(), last.date(), log)
+                paths = [p for p in (made if isinstance(made, tuple) else (made,)) if p]
+                if paths:
+                    root.after(0, lambda: messagebox.showinfo(APP_NAME, "売上集計を作成しました。\n" + "\n".join(map(str, paths))))
                 else:
-                    root.after(0, lambda: messagebox.showerror(APP_NAME, "楽天・Amazon の API キーが shipping_export.ini にありません"))
+                    root.after(0, lambda: messagebox.showerror(APP_NAME, "API のキーが shipping_export.ini にありません"))
             except Exception as e:
                 log(f"エラー: {e}")
                 log(traceback.format_exc())
                 root.after(0, lambda: messagebox.showerror(APP_NAME, f"エラーが発生しました。\n{e}"))
             finally:
-                root.after(0, lambda: ship_btn.configure(state="normal"))
+                root.after(0, lambda: btn.configure(state="normal"))
 
         threading.Thread(target=work, daemon=True).start()
 
-    ship_btn.configure(command=run_ship_sales)
+    ship_btn.configure(command=lambda: run_ship_sales(ship_btn, create_ship_sales))
+    item_btn.configure(command=lambda: run_ship_sales(item_btn, create_rakuten_item_sales))
     log(f"設定ファイル: {CONFIG_FILE}")
     log(f"出力先: {cfg['output_dir']}")
     if not (cfg["rakuten_secret"] and cfg["rakuten_key"]):

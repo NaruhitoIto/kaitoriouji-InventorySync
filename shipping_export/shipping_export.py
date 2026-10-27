@@ -71,6 +71,8 @@ rakuten_mall = 楽天市場店
 amazon_mall = Amazon店
 mercari_mall = メルカリ
 yahoo_mall = ヤフオク店
+; ヤフーの注文のうちオークションIDが無いもの（ショッピングの注文）のモール名
+yahoo_shopping_mall = ヤフーショッピング店
 ; 個人のヤフオクアカウント（取引ナビの貼り付け）
 auction_mall = ヤフオク1
 ; 楽天の発送待ち注文を何日前までさかのぼって探すか（最大62）
@@ -150,7 +152,7 @@ def load_config():
         "output_dir": out if out.is_absolute() else APP_DIR / out,
         "status": s.get("status", "本日発送分"), "carrier": s.get("carrier", "日本郵便"),
         "mall": {"rakuten": s.get("rakuten_mall", "楽天市場店"), "amazon": s.get("amazon_mall", "Amazon店"),
-                 "mercari": s.get("mercari_mall", "メルカリ"), "yahoo": s.get("yahoo_mall", "ヤフオク店"),
+                 "mercari": s.get("mercari_mall", "メルカリ"), "yahoo": s.get("yahoo_mall", "ヤフオク店"), "yahoo_shopping": s.get("yahoo_shopping_mall", "ヤフーショッピング店"),
                  "auction": s.get("auction_mall", "ヤフオク1")},
         "rakuten_days": min(int(s.get("rakuten_days", "30") or 30), 62),
     }
@@ -440,6 +442,29 @@ def line_values(v):
     return [x.strip() for _, x in sorted(found, key=lambda t: int(t[0]))]
 
 
+def is_yahoo_items(header):
+    """ストアクリエイターProの注文データの明細ファイル（default_all_items.csv）かどうか。"""
+    return "Order ID" in header and "Line ID" in header and "Product Code" in header
+
+
+def read_yahoo_items(rows):
+    """明細ファイルを {(注文番号, 明細番号): (Product Code, Description)} にする。"""
+    return {(r.get("Order ID", "").strip(), int(num(r.get("Line ID")))): (r.get("Product Code", "").strip(), r.get("Description", ""))
+            for r in rows if r.get("Order ID", "").strip()}
+
+
+def yahoo_item_code(item, title):
+    """明細の商品コード。ショッピングの注文は Product Code が商品番号。オークションは AUCTION+オークションID なので、
+    そのときは商品名（Description）の中の商品番号を使う。分からなければ ""。"""
+    if not item:
+        return ""
+    code, desc = item
+    if code and not code.upper().startswith("AUCTION"):
+        return code.upper()
+    found = SKU_IN_TEXT.findall(desc or "")
+    return found[-1].upper() if found else ""
+
+
 def read_yahoo(cfg, rows, log, since):
     orders, unpaid = {}, set()
     for r in rows:
@@ -451,7 +476,9 @@ def read_yahoo(cfg, rows, log, since):
             continue
         if oid not in orders:
             # ワサビの注文番号は「ストアID-注文番号」（例 vivoage-10215030）
-            o = new_order(cfg["mall"]["yahoo"], f"{cfg['yahoo_prefix']}{oid}", parse_dt(r.get("OrderTime")))
+            # オークションIDが無いのはヤフーショッピングの注文（ワサビでは別のモール）
+            mall_name = cfg["mall"]["yahoo"] if r.get("YahooAuctionId", "").strip() else cfg["mall"]["yahoo_shopping"]
+            o = new_order(mall_name, f"{cfg['yahoo_prefix']}{oid}", parse_dt(r.get("OrderTime")))
             set_buyer(o, r.get("BillName", ""), r.get("BillNameKana", ""), r.get("BillMailAddress", ""), r.get("BillPrefecture", ""),
                       r.get("BillZipCode", ""), r.get("BillCity", ""), join(r.get("BillAddress1"), r.get("BillAddress2")),
                       r.get("BillPhoneNumber", ""))
@@ -471,6 +498,9 @@ def read_yahoo(cfg, rows, log, since):
             sku = skus[i] if i < len(skus) else ""
             price = num(subs[i]) if i < len(subs) else 0
             if not sku:
+                # ショッピングの注文は商品コード（D列）が空。明細ファイル（default_all_items）があればその商品コードを使う
+                sku = yahoo_item_code(cfg.get("yahoo_items", {}).get((oid, i + 1)), title)
+            if not sku:
                 # 複数商品の注文は商品コード（D列）が1つ目の分しか無い。タイトルに商品番号があれば使う
                 # （無ければ出荷データを作るときに fill_missing_skus でワサビの商品名から探す）
                 found = SKU_IN_TEXT.findall(title)
@@ -478,7 +508,7 @@ def read_yahoo(cfg, rows, log, since):
             o["items"].append((title, sku, price, 1))
             o["head"]["小計"] += price
     if unpaid:
-        log(f"ヤフオク: 未入金の注文 {len(unpaid)}件は出力しません: {', '.join(sorted(unpaid)[:10])}")
+        log(f"ヤフー: 未入金の注文 {len(unpaid)}件は出力しません: {', '.join(sorted(unpaid)[:10])}")
     return list(orders.values())
 
 
@@ -666,7 +696,7 @@ def parse_navi(cfg, text, now=None):
 
 
 READERS = {"amazon": read_amazon, "mercari": read_mercari, "yahoo": read_yahoo}
-MALL_JA = {"rakuten": "楽天", "amazon": "Amazon", "mercari": "メルカリ", "yahoo": "ヤフオク", "auction": "ヤフオク1"}
+MALL_JA = {"rakuten": "楽天", "amazon": "Amazon", "mercari": "メルカリ", "yahoo": "ヤフー", "auction": "ヤフオク1"}
 # 同時刻の重複ではキャンセルの影響が大きいモールを優先して発送
 MALL_PRIORITY = {"amazon": 0, "rakuten": 1, "mercari": 2, "yahoo": 3, "auction": 4}
 
@@ -777,8 +807,20 @@ def create(cfg, since, files, use_rakuten, skip_done, hold_dupes, log, navi=()):
     if navi:
         log(f"ヤフオク1: 取引ナビから注文 {len(navi)}件")
         collected += [("auction", o) for o in navi]
+    cfg["yahoo_items"] = {}
+    order_files = []
     for f in files:
         header, rows = read_table(f)
+        if "Order ID" in header and "Order Kind" in header:
+            log(f"ヤフー注文データ: {Path(f).name} は使いません（注文は download.csv 形式、商品コードは明細ファイルから読みます）")
+            continue
+        if is_yahoo_items(header):
+            got = read_yahoo_items(rows)
+            cfg["yahoo_items"].update(got)
+            log(f"ヤフー明細: {Path(f).name} から {len(got)}行（ヤフーの注文の商品コードを補うのに使います）")
+            continue
+        order_files.append((f, header, rows))
+    for f, header, rows in order_files:
         if is_shipped_list(header):
             got = read_shipped(rows)
             shipped |= got
@@ -924,7 +966,9 @@ def main_gui():
             header, _ = read_table(f)
             mall = detect_mall(header)
             files.append(f)
-            label = "出荷済みリスト" if is_shipped_list(header) else MALL_JA.get(mall, "不明")
+            label = ("出荷済みリスト" if is_shipped_list(header) else "ヤフー明細" if is_yahoo_items(header)
+                     else "ヤフー注文データ（使いません）" if "Order Kind" in header
+                     else MALL_JA.get(mall, "不明"))
             lst.insert("end", f"[{label}] {f}")
 
     def paste_navi():

@@ -517,36 +517,93 @@ def read_yahoo(cfg, rows, log, since):
 TITLE_CODE = re.compile(r"^([A-Za-z]\d{3}-(\d{4})-\d{2})(?=\s)")  # タイトル先頭の管理コード（例 m543-0011-15）
 
 
+WS_BATCH = 50  # 1回の検索で調べる商品名の数（1件ずつ探すと数百件で数十分かかるため、まとめて in で検索する）
+
+
+def ws_post(ws, query, page=1, limit=10):
+    """ワサビの商品検索を1回呼ぶ。サーバー側のエラー（500番台）はしばらく待って2回までやり直す。"""
+    for attempt in range(3):
+        r = requests.post(f"{ws['base_url']}/api/products/search", timeout=120, json={
+            "sort": "product_id", "reverse": False, "page": page, "limit": limit, "query": query},
+            headers={"Authorization": f"Bearer {ws['token']}", "Content-Type": "application/json", "Accept": "application/json"})
+        time.sleep(0.4)  # 速度制限（約3リクエスト/秒）を守る
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code < 500 and r.status_code != 429:
+            break
+        time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"ワサビの商品検索 HTTP {r.status_code}")
+
+
 def ws_search(ws, query):
     """ワサビの商品検索。該当した商品番号のリストを返す。"""
-    r = requests.post(f"{ws['base_url']}/api/products/search", timeout=60, json={
-        "sort": "product_id", "reverse": False, "page": 1, "limit": 10, "query": query},
-        headers={"Authorization": f"Bearer {ws['token']}", "Content-Type": "application/json", "Accept": "application/json"})
-    time.sleep(0.4)  # 速度制限（約3リクエスト/秒）を守る
-    if r.status_code != 200:
-        raise RuntimeError(f"ワサビの商品検索 HTTP {r.status_code}")
-    return list(dict.fromkeys(str(d.get("商品番号") or "").strip() for d in r.json().get("data", []) if d.get("商品番号")))
+    return list(dict.fromkeys(str(d.get("商品番号") or "").strip() for d in ws_post(ws, query).get("data", []) if d.get("商品番号")))
 
 
-def ws_find_sku(ws, title):
-    """ヤフオクの商品タイトルからワサビの商品番号を探す。戻り値は (商品番号, 候補)。1件に決まらなければ商品番号は ""。
-    ワサビの「ヤフー｜商品名」がヤフオクのタイトルと同じ。本・CDなどは「表示用商品名」から【中古】を除いたものがタイトル。"""
-    title = title.strip()
-    m = TITLE_CODE.match(title)
-    tries = [{"ヤフー｜商品名": {"eq": title}}]
-    if m:
-        tries.append({"ヤフー｜商品名": {"starts": m.group(1)}})  # タイトルの空白などが少し違っても見つかるように
-    tries += [{"表示用商品名": {"eq": "【中古】" + title}}, {"表示用商品名": {"eq": title}}]
-    for q in tries:
-        found = ws_search(ws, q)
-        if m and len(found) > 1:
-            # 管理コードの真ん中の4桁は商品番号の末尾4桁
-            found = [s for s in found if s.endswith(m.group(2))] or found
-        if len(found) == 1:
-            return found[0], found
-        if found:
-            return "", found
-    return "", []
+def ws_search_all(ws, query, limit=100):
+    """ワサビの商品検索（全ページ）。該当した商品のリストを返す。"""
+    items, page = [], 1
+    while True:
+        d = ws_post(ws, query, page, limit)
+        items += d.get("data", [])
+        if not d.get("data") or page * limit >= int(d.get("total") or 0):
+            return items
+        page += 1
+
+
+def ws_find_skus(ws, titles, log=None, label="ワサビ"):
+    """ヤフオクの商品タイトルからワサビの商品番号を探す。戻り値は ({タイトル: (商品番号, 候補)}, 途中で起きたエラー)。
+    1件に決まらなければ商品番号は ""。
+    ワサビの「ヤフー｜商品名」がヤフオクのタイトルと同じ。本・CDなどは「表示用商品名」から【中古】を除いたものがタイトル。
+    探す順番: ①ヤフー｜商品名が同じ ②ヤフー｜商品名がタイトル先頭の管理コードで始まる ③表示用商品名が「【中古】＋タイトル」
+    ④表示用商品名がタイトルと同じ。①③④は WS_BATCH 件ずつまとめて検索する。"""
+    titles = list(dict.fromkeys(t.strip() for t in titles if t.strip()))
+    hits = {t: {} for t in titles}  # タイトル → {段階: [商品番号]}
+    note = log or (lambda s: None)
+
+    def bulk(field, wanted, step):  # wanted: {検索する値: [(タイトル, 段階)]}
+        vals = list(wanted)
+        for i in range(0, len(vals), WS_BATCH):
+            for d in ws_search_all(ws, {field: {"in": vals[i:i + WS_BATCH]}}):
+                sku = str(d.get("商品番号") or "").strip()
+                for t, stage in wanted.get(str(d.get(field) or "").strip(), []) if sku else []:
+                    hits[t].setdefault(stage, []).append(sku)
+            note(f"{label}: ワサビで商品番号を検索中（{step} {min(i + WS_BATCH, len(vals))}/{len(vals)}）")
+
+    error = None
+    try:
+        note(f"{label}: 商品番号が分からない商品名 {len(titles)}種類をワサビで探します")
+        bulk("ヤフー｜商品名", {t: [(t, 1)] for t in titles}, "ヤフー｜商品名")
+        coded = [t for t in titles if not hits[t] and TITLE_CODE.match(t)]
+        for n, t in enumerate(coded, 1):  # 管理コードで始まるものは1件ずつ（まとめて検索できないため）
+            found = ws_search(ws, {"ヤフー｜商品名": {"starts": TITLE_CODE.match(t).group(1)}})
+            if found:
+                hits[t][2] = found
+            if n % 20 == 0 or n == len(coded):
+                note(f"{label}: ワサビで商品番号を検索中（管理コード {n}/{len(coded)}）")
+        wanted = {}
+        for t in titles:
+            if not hits[t]:
+                wanted.setdefault("【中古】" + t, []).append((t, 3))
+                wanted.setdefault(t, []).append((t, 4))
+        if wanted:
+            bulk("表示用商品名", wanted, "表示用商品名")
+    except Exception as e:  # 通信エラーなど。それまでに見つかった分は使う
+        error = e
+
+    result = {}
+    for t in titles:
+        m = TITLE_CODE.match(t)
+        result[t] = ("", [])
+        for stage in sorted(hits[t]):
+            found = list(dict.fromkeys(hits[t][stage]))
+            if m and len(found) > 1:
+                # 管理コードの真ん中の4桁は商品番号の末尾4桁
+                found = [s for s in found if s.endswith(m.group(2))] or found
+            if found:
+                result[t] = (found[0] if len(found) == 1 else "", found)
+                break
+    return result, error
 
 
 def fill_missing_skus(cfg, orders, mall_ja, log):
@@ -559,15 +616,11 @@ def fill_missing_skus(cfg, orders, mall_ja, log):
         log(f"{mall_ja}: 商品コードが無い明細 {len(missing)}件（ワサビのトークンが未設定のため探していません。手作業で確認）: "
             + ", ".join(label(o, i) for o, i in missing[:10]))
         return
-    left, error = [], None
+    found, error = ws_find_skus(cfg["wasabi"], [o["items"][i][0] for o, i in missing], log if len(missing) > WS_BATCH else None, mall_ja)
+    left = []
     for o, i in missing:
         title, _, price, qty = o["items"][i]
-        sku, cands = "", []
-        if not error:
-            try:
-                sku, cands = ws_find_sku(cfg["wasabi"], title)
-            except Exception as e:  # 通信エラーなど。出荷データの作成は止めない
-                error = e
+        sku, cands = found.get(title.strip(), ("", []))
         if sku:
             o["items"][i] = (title, sku, price, qty)
         else:
@@ -989,12 +1042,12 @@ def create_sales(cfg, files, log):
 
     missing = [r for r in out if not r["商品番号"]]
     if missing and cfg["wasabi"]:
+        log(f"売上明細: 商品名と注文CSVで商品番号が分からない明細 {len(missing)}行")
+        found, error = ws_find_skus(cfg["wasabi"], [r["商品名"] for r in missing], log, "売上明細")
+        if error:  # 通信エラーなど。売上明細の作成は止めない
+            log(f"売上明細: ワサビで商品番号を探す途中でエラーになりました（{type(error).__name__}: {str(error)[:80]}）")
         for r in missing:
-            try:
-                sku, _ = ws_find_sku(cfg["wasabi"], r["商品名"])
-            except Exception as e:  # 通信エラーなど。売上明細の作成は止めない
-                log(f"売上明細: ワサビで商品番号を探す途中でエラーになりました（{type(e).__name__}）")
-                break
+            sku = found.get(r["商品名"].strip(), ("", []))[0]
             if sku:
                 r["商品番号"], r["商品番号の取得元"] = sku.upper(), "ワサビの商品名"
     left = [r for r in out if not r["商品番号"]]

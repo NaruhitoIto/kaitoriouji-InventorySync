@@ -272,12 +272,16 @@ def rakuten_term(v):
     return v
 
 
+def rakuten_headers(cfg):
+    token = base64.b64encode(f"{cfg['rakuten_secret']}:{cfg['rakuten_key']}".encode()).decode()
+    return {"Authorization": f"ESA {token}", "Content-Type": "application/json; charset=UTF-8"}
+
+
 def fetch_rakuten(cfg, since, log):
     if not cfg["rakuten_secret"] or not cfg["rakuten_key"]:
         log("楽天: shipping_export.ini に API のキーが無いため取得しません")
         return []
-    token = base64.b64encode(f"{cfg['rakuten_secret']}:{cfg['rakuten_key']}".encode()).decode()
-    h = {"Authorization": f"ESA {token}", "Content-Type": "application/json; charset=UTF-8"}
+    h = rakuten_headers(cfg)
     now = datetime.now(JST)
     start = max(since, now - timedelta(days=cfg["rakuten_days"]))
     numbers, page = [], 1
@@ -765,19 +769,27 @@ def read_shipped(rows):
 
 # ---------------------------------------------------------------- Amazon（キャンセル・発送済みの確認）
 
+def amazon_token(a):
+    """Amazon（SP-API）のアクセストークンを取る。"""
+    t = requests.post("https://api.amazon.com/auth/o2/token", timeout=60, data={
+        "grant_type": "refresh_token", "refresh_token": a["refresh_token"],
+        "client_id": a["client_id"], "client_secret": a["client_secret"]})
+    if t.status_code != 200:
+        raise RuntimeError(f"Amazon の認証 HTTP {t.status_code}")
+    return t.json()["access_token"]
+
+
 def amazon_open_orders(cfg, created_after, log):
     """Amazon の「未発送（Unshipped / PartiallyShipped）」の自己発送注文の注文番号を返す。確認できなければ None。"""
     a = cfg["amazon"]
     if not a:
         log("Amazon: API のキーが無いため、キャンセル・発送済みの確認はしません（未出荷の注文レポートを使ってください）")
         return None
-    t = requests.post("https://api.amazon.com/auth/o2/token", timeout=60, data={
-        "grant_type": "refresh_token", "refresh_token": a["refresh_token"],
-        "client_id": a["client_id"], "client_secret": a["client_secret"]})
-    if t.status_code != 200:
-        log(f"Amazon: 認証に失敗したため、キャンセルの確認はしません（HTTP {t.status_code}）")
+    try:
+        h = {"x-amz-access-token": amazon_token(a), "Accept": "application/json"}
+    except RuntimeError as e:
+        log(f"Amazon: 認証に失敗したため、キャンセルの確認はしません（{e}）")
         return None
-    h = {"x-amz-access-token": t.json()["access_token"], "Accept": "application/json"}
     params = {"MarketplaceIds": a["marketplace_id"], "OrderStatuses": "Unshipped,PartiallyShipped",
               "FulfillmentChannels": "MFN", "MaxResultsPerPage": 100,
               "CreatedAfter": (created_after - timedelta(minutes=5)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
@@ -1089,6 +1101,159 @@ def create_sales(cfg, files, log):
 
 # ---------------------------------------------------------------- 画面
 
+# ---------------------------------------------------------------- 発送日ごとの売上集計（楽天・Amazon）
+
+SHIP_SALES_ITEMS = ("売上金額", "売上点数", "売上件数")
+RAKUTEN_CANCELLED = {"800", "900"}  # キャンセル確定待ち・キャンセル確定
+
+
+def rakuten_ship_sales(cfg, first, last, log):
+    """楽天の発送日ごとの売上 {日付: [売上金額, 売上点数, 売上件数]}。RMS の発送日で1日ずつ注文を検索する。
+    売上金額は商品代金＋送料（税込。goodsPrice + postagePrice）。キャンセルされた注文は除く。"""
+    h = rakuten_headers(cfg)
+    ship_day, day = {}, first  # 注文番号 → 発送日（期間内で最初に見つかった日）
+    while day <= last:
+        start = datetime(day.year, day.month, day.day, tzinfo=JST)
+        page = 1
+        while True:
+            body = {"version": 7, "dateType": 4,  # 4 = 発送日
+                    "startDatetime": start.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "endDatetime": (start + timedelta(days=1, seconds=-1)).strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "PaginationRequestModel": {"requestRecordsAmount": 1000, "requestPage": page}}
+            r = requests.post("https://api.rms.rakuten.co.jp/es/2.0/order/searchOrder/", headers=h, json=body, timeout=60)
+            if r.status_code != 200:
+                raise RuntimeError(f"楽天 searchOrder エラー HTTP {r.status_code}: {r.text[:300]}")
+            data = r.json()
+            if any(m.get("messageType") == "ERROR" for m in data.get("MessageModelList") or []):
+                raise RuntimeError(f"楽天 searchOrder エラー: {data['MessageModelList']}")
+            for n in data.get("orderNumberList") or []:
+                ship_day.setdefault(n, day)
+            if page >= int((data.get("PaginationResponseModel") or {}).get("totalPages", 1) or 1):
+                break
+            page += 1
+        day += timedelta(days=1)
+    log(f"売上集計: 楽天 発送日が期間内の注文 {len(ship_day):,}件。明細を取得します")
+    out, cancelled, numbers = {}, 0, list(ship_day)
+    for i in range(0, len(numbers), 100):
+        r = requests.post("https://api.rms.rakuten.co.jp/es/2.0/order/getOrder/", headers=h,
+                          json={"orderNumberList": numbers[i:i + 100], "version": 7}, timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"楽天 getOrder エラー HTTP {r.status_code}: {r.text[:300]}")
+        for m in r.json().get("OrderModelList", []):
+            if str(m.get("orderProgress")) in RAKUTEN_CANCELLED:
+                cancelled += 1
+                continue
+            s = out.setdefault(ship_day[m["orderNumber"]], [0, 0, 0])
+            s[0] += num(m.get("goodsPrice")) + num(m.get("postagePrice"))
+            s[1] += sum(num(it.get("units")) for p in m.get("PackageModelList") or [] for it in p.get("ItemModelList") or [])
+            s[2] += 1
+        if (i // 100 + 1) % 20 == 0:
+            log(f"売上集計: 楽天 明細を取得中 {min(i + 100, len(numbers)):,}/{len(numbers):,}")
+    if cancelled:
+        log(f"売上集計: 楽天 キャンセルされた注文 {cancelled}件は除きました")
+    return out
+
+
+def amazon_ship_sales(cfg, first, last, log):
+    """Amazon の発送日ごとの売上 {日付: [売上金額, 売上点数, 売上件数]}。財務イベントの「出荷」（ShipmentEvent。
+    出荷を確定すると計上される）の計上日時を発送日とする。売上金額は商品代金・送料・ギフト包装とそれぞれの税の合計から
+    割引（プロモーション）を引いた額（注文合計と同じ）。返金は引かない。"""
+    a = cfg["amazon"]
+    h = {"x-amz-access-token": amazon_token(a), "Accept": "application/json"}
+    start = datetime(first.year, first.month, first.day, tzinfo=JST)
+    end = min(datetime(last.year, last.month, last.day, tzinfo=JST) + timedelta(days=1),
+              datetime.now(JST) - timedelta(minutes=3))  # 終わりは2分以上前でないといけない
+    utc = lambda d: d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    money = lambda x: float((x or {}).get("CurrencyAmount") or 0)
+    params = {"PostedAfter": utc(start), "PostedBefore": utc(end), "MaxResultsPerPage": 100}
+    amounts, orders, pages = {}, {}, 0
+    while True:
+        began = time.time()
+        for attempt in range(8):
+            r = requests.get(f"{a['endpoint']}/finances/v0/financialEvents", headers=h, params=params, timeout=60)
+            if r.status_code not in (429, 500, 503):
+                break
+            time.sleep(min(60, 3 * (attempt + 1)))
+        if r.status_code != 200:
+            raise RuntimeError(f"Amazon 財務イベント HTTP {r.status_code}: {r.text[:300]}")
+        pl = r.json().get("payload", {})
+        for e in (pl.get("FinancialEvents") or {}).get("ShipmentEventList") or []:
+            posted = parse_dt(e.get("PostedDate"))
+            if not posted:
+                continue
+            s = amounts.setdefault(posted.date(), [0.0, 0, 0])
+            for it in e.get("ShipmentItemList") or []:
+                s[0] += sum(money(x.get("ChargeAmount")) for x in it.get("ItemChargeList") or [])
+                s[0] += sum(money(p.get("PromotionAmount")) for p in it.get("PromotionList") or [])
+                s[1] += num(it.get("QuantityShipped"))
+            orders.setdefault(posted.date(), set()).add(e.get("AmazonOrderId"))
+        pages += 1
+        if pages % 10 == 0:
+            log(f"売上集計: Amazon 財務イベントを取得中（{pages}ページ）")
+        if not pl.get("NextToken"):
+            break
+        params = {"NextToken": pl["NextToken"]}
+        time.sleep(max(0.0, 2.05 - (time.time() - began)))  # 財務イベントは 0.5回/秒
+    return {d: [round(s[0]), s[1], len(orders[d])] for d, s in amounts.items()}
+
+
+def create_ship_sales(cfg, first, last, log):
+    """発送日ごとの売上金額・売上点数・売上件数を、楽天・Amazon の API から集計して CSV に出す。
+    戻り値は CSV のパス。どちらのキーも無ければ None。楽天と Amazon は同時に取得する
+    （Amazon は呼び出し回数の制限で1日分に30秒ほど、1か月分で15分ほどかかる）。"""
+    jobs = {}
+    if cfg["rakuten_secret"] and cfg["rakuten_key"]:
+        jobs["rakuten"] = rakuten_ship_sales
+    else:
+        log("売上集計: 楽天の API キーが無いため、楽天は集計しません")
+    if cfg["amazon"]:
+        jobs["amazon"] = amazon_ship_sales
+        log(f"売上集計: Amazon は1日分に30秒ほどかかります（{(last - first).days + 1}日分）")
+    else:
+        log("売上集計: Amazon の API キーが無いため、Amazon は集計しません")
+    if not jobs:
+        return None
+    data, errors = {}, []
+
+    def fetch(m):
+        try:
+            data[m] = jobs[m](cfg, first, last, log)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=fetch, args=(m,), daemon=True) for m in jobs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+    data = {m: data[m] for m in jobs}  # 列の並びを楽天・Amazon の順にする
+    header = ["発送日"] + [f"{MALL_JA[m]} {k}" for m in data for k in SHIP_SALES_ITEMS] + [f"合計 {k}" for k in SHIP_SALES_ITEMS]
+    rows, totals, day = [], {m: [0, 0, 0] for m in data}, first
+    while day <= last:
+        row, all_ = [day.strftime("%Y-%m-%d")], [0, 0, 0]
+        for m in data:
+            v = data[m].get(day, [0, 0, 0])
+            row += v
+            for i in range(3):
+                all_[i] += v[i]
+                totals[m][i] += v[i]
+        rows.append(row + all_)
+        day += timedelta(days=1)
+    rows.append(["合計"] + [x for m in data for x in totals[m]] + [sum(totals[m][i] for m in data) for i in range(3)])
+    cfg["output_dir"].mkdir(parents=True, exist_ok=True)
+    path = cfg["output_dir"] / f"売上集計_発送日_{first:%Y%m%d}-{last:%Y%m%d}_{datetime.now(JST):%Y%m%d%H%M%S}.csv"
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:  # Excel でそのまま開けるように BOM 付き
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+    for m in data:
+        log(f"売上集計: {MALL_JA[m]} 売上金額 {totals[m][0]:,}円 / 売上点数 {totals[m][1]:,}点 / 売上件数 {totals[m][2]:,}件")
+    log(f"売上集計を作成しました: {path.name}")
+    return path
+
+
 def main_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, scrolledtext
@@ -1097,7 +1262,7 @@ def main_gui():
     history = load_history()
     root = tk.Tk()
     root.title(APP_NAME)
-    root.geometry("760x580")
+    root.geometry("860x610")
     files = []  # 一覧の行ごとに、注文ファイルのパスか、取引ナビから読み取ったヤフオク1の注文（dict）
 
     frm = tk.Frame(root, padx=10, pady=8)
@@ -1113,6 +1278,15 @@ def main_gui():
     hold_var = tk.BooleanVar(value=True)
     tk.Checkbutton(frm, text="同じ商品の重複注文は、先に注文された方だけ出力する（後の方は「重複注文_要確認」に出す）",
                    variable=hold_var).grid(row=3, column=0, columnspan=2, sticky="w")
+    yesterday = (datetime.now(JST) - timedelta(days=1)).date()
+    sf = tk.Frame(frm)
+    sf.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    tk.Label(sf, text="売上集計（楽天・Amazon）の発送日").pack(side="left")
+    ship_from_var = tk.StringVar(value=yesterday.replace(day=1).strftime("%Y-%m-%d"))
+    ship_to_var = tk.StringVar(value=yesterday.strftime("%Y-%m-%d"))
+    tk.Entry(sf, textvariable=ship_from_var, width=12).pack(side="left", padx=(6, 2))
+    tk.Label(sf, text="〜").pack(side="left")
+    tk.Entry(sf, textvariable=ship_to_var, width=12).pack(side="left", padx=2)
 
     tk.Label(root, text="ファイル（出荷済みリスト end-order.csv、Amazon の注文レポート、メルカリ・ヤフオクの注文CSV）", padx=10).pack(anchor="w")
     tk.Label(root, text="ヤフオク1（個人）: 取引ナビのページで Ctrl+A → Ctrl+C してから「取引ナビを貼り付け」（1件ずつ）",
@@ -1173,6 +1347,8 @@ def main_gui():
     run_btn.pack(side="right")
     sales_btn = tk.Button(bf, text="売上明細（ヤフオク店）", padx=8)
     sales_btn.pack(side="right", padx=6)
+    ship_btn = tk.Button(bf, text="売上集計（楽天・Amazon）", padx=8)
+    ship_btn.pack(side="right")
     tk.Button(bf, text="出力フォルダを開く", command=lambda: (cfg["output_dir"].mkdir(parents=True, exist_ok=True),
                                                          os.startfile(cfg["output_dir"]))).pack(side="right", padx=6)
 
@@ -1245,6 +1421,31 @@ def main_gui():
         threading.Thread(target=work, daemon=True).start()
 
     sales_btn.configure(command=run_sales)
+
+    def run_ship_sales():
+        first, last = parse_dt(ship_from_var.get()), parse_dt(ship_to_var.get())
+        if not first or not last or last < first:
+            messagebox.showerror(APP_NAME, "売上集計の発送日を 2026-10-01 〜 2026-10-26 のように入力してください")
+            return
+        ship_btn.configure(state="disabled")
+
+        def work():
+            try:
+                path = create_ship_sales(cfg, first.date(), last.date(), log)
+                if path:
+                    root.after(0, lambda: messagebox.showinfo(APP_NAME, f"売上集計を作成しました。\n{path}"))
+                else:
+                    root.after(0, lambda: messagebox.showerror(APP_NAME, "楽天・Amazon の API キーが shipping_export.ini にありません"))
+            except Exception as e:
+                log(f"エラー: {e}")
+                log(traceback.format_exc())
+                root.after(0, lambda: messagebox.showerror(APP_NAME, f"エラーが発生しました。\n{e}"))
+            finally:
+                root.after(0, lambda: ship_btn.configure(state="normal"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    ship_btn.configure(command=run_ship_sales)
     log(f"設定ファイル: {CONFIG_FILE}")
     log(f"出力先: {cfg['output_dir']}")
     if not (cfg["rakuten_secret"] and cfg["rakuten_key"]):

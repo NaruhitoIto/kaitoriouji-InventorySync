@@ -7,6 +7,7 @@
   メルカリ・ヤフオクの注文（手動ファイル）→ 楽天・Amazon・ヤフーのストアの在庫を0
   ヤフーショッピングの注文（注文API、承認されるまでは手動ファイル）→ ワサビ・楽天・Amazon の在庫を0
   どこかで売れたSKU                  → メルカリ・ヤフオクで手動で止める一覧（todo/）を作る
+  ワサビで在庫0になったSKU（毎時の wasabi_stock_sync が ws_zero_queue.txt に書く）→ ヤフーのストアの在庫を0
 
 在庫は「0にする」方向しか送らない（売れた1点物を止めるだけ）。キャンセル・返品で戻すのは手動。
 WS の状態ファイル（wasabi_stock_state.json）は読むだけで変更しない（WS 復旧後の処理を壊さないため）。
@@ -550,6 +551,22 @@ def backfill_targets(state):
     return added
 
 
+def yahoo_store_split(ycfg, codes):
+    """ヤフーのストアの在庫参照APIで、商品コードを (ストアに無い, すでに在庫0, 在庫が残っている) に分ける。"""
+    import yahoo_shopping_api as yapi
+    stock = yapi.get_stock(ycfg, codes)
+    absent, already, to_zero = [], [], []
+    for k in codes:
+        s = stock.get(k) or {}
+        if s.get("status") != "1":
+            absent.append(k)
+        elif s.get("quantity") == "0":
+            already.append(k)
+        else:
+            to_zero.append(k)
+    return absent, already, to_zero
+
+
 def push_yahoo_store(state, dry, validate):
     """ヤフーのストア（Yahoo!ショッピング）で在庫0にする。在庫参照APIでストアにある・在庫が残っている商品だけを
     在庫更新APIで0にする。ストアに無い商品は absent として以後は送らない。"""
@@ -559,22 +576,13 @@ def push_yahoo_store(state, dry, validate):
     try:
         import yahoo_shopping_api as yapi
         ycfg = yapi.load_config()
-        stock = yapi.get_stock(ycfg, todo)
+        absent, already, to_zero = yahoo_store_split(ycfg, todo)
     except SystemExit as e:
         log.warning(f"ヤフーのストア: 在庫を確認できないため今回は送りません（{e}）")
         return
     except Exception as e:
         log.error(f"ヤフーのストア: 在庫参照に失敗しました（次回再試行）: {e}")
         return
-    absent, already, to_zero = [], [], []
-    for k in todo:
-        s = stock.get(k) or {}
-        if s.get("status") != "1":
-            absent.append(k)
-        elif s.get("quantity") == "0":
-            already.append(k)
-        else:
-            to_zero.append(k)
     log.info(f"ヤフーのストア: 在庫0にする {len(to_zero)}件 / すでに0 {len(already)}件 / ストアに無い {len(absent)}件")
     if dry or validate:
         if to_zero:
@@ -644,6 +652,107 @@ def push_wasabi(state, dry, validate):
         e = state["ledger"][k]
         e["tries"]["wasabi"] = e["tries"].get("wasabi", 0) + 1
         e["push"]["wasabi"] = result
+
+
+# ---------- ワサビで在庫0になった商品 → ヤフーのストアでも0 ----------
+# ワサビはヤフーのストアへ在庫0を送っていない（他で売れた商品がヤフーで売れてしまう）。毎時の wasabi_stock_sync が
+# 楽天に在庫0を送ったSKUを ws_zero_queue.txt に追記するので、それを受け取ってヤフーのストアでも0にする。
+# 台帳（ledger）とは別に state["ws_zero"]（{SKU: 失敗回数}）で持ち、済んだものは消す。
+
+def collect_ws_zero(state, dry):
+    """ws_zero_queue.txt を受け取り、ヤフーのストアで0にする候補に加える。"""
+    pend = state.setdefault("ws_zero", {})
+    queue, work = ws.ZERO_QUEUE, ws.ZERO_QUEUE.with_suffix(".work")
+    if dry:  # dry-run では受け取らずに件数だけ見る
+        skus = {norm(s) for p in (queue, work) if p.exists() for s in p.read_text(encoding="utf-8").split()}
+        if skus:
+            log.info(f"ワサビで在庫0になったSKU: 受け取り待ち {len(skus)}件（dry-run のため受け取りません）")
+        return
+    if not work.exists():  # .work が残っていれば前回の受け取り途中。先にそれを読む
+        if not queue.exists():
+            return
+        try:
+            queue.replace(work)
+        except OSError:  # wasabi_stock_sync が書き込み中。次回受け取る
+            return
+    skus = {norm(s) for s in work.read_text(encoding="utf-8").split() if s.strip()}
+    new = [s for s in skus if s not in pend]
+    pend.update({s: 0 for s in new})
+    log.info(f"ワサビで在庫0になったSKU: 受け取り {len(skus)}件 / ヤフーのストアで0にする候補 {len(pend)}件")
+    save_state(state)  # 保存してから受け取りファイルを消す（途中で止まっても失わない）
+    work.unlink()
+
+
+def ws_stock_check(wcfg, codes):
+    """ワサビの在庫を商品番号でまとめて確かめ、(在庫0, 在庫あり, ワサビに無い) に分ける。"""
+    found = {}
+    for i in range(0, len(codes), ws.RECHECK_BATCH):
+        batch = codes[i:i + ws.RECHECK_BATCH]
+        page, got = 1, 0
+        while True:
+            data = ws.fetch_page(wcfg, page, {"商品番号": {"in": batch}})
+            items = data.get("data", [])
+            for it in items:
+                sku = norm(str(it.get("商品番号") or ""))
+                q = ws.parse_stock(it.get("在庫数"))
+                found[sku] = max(found.get(sku, 0), 1 if q is None else q)  # 在庫数が読めなければ在庫ありとみなす
+            got += len(items)
+            if not items or got >= (data.get("total") or 0):
+                break
+            page += 1
+            time.sleep(0.4)
+        time.sleep(0.4)
+    return ([c for c in codes if found.get(c) == 0], [c for c in codes if found.get(c, 0) > 0],
+            [c for c in codes if c not in found])
+
+
+def push_ws_zero_to_yahoo(state, cfg, dry, validate):
+    """ワサビで在庫0になったSKUを、ヤフーのストアでも0にする。送る直前にワサビの在庫を確かめ直し、
+    在庫が残っているもの（楽天の出品をやめただけなど）やワサビに無いものは送らない。"""
+    pend = state.get("ws_zero") or {}
+    if not pend:
+        return
+    codes = sorted(pend)
+    try:
+        import yahoo_shopping_api as yapi
+        zero, in_stock, unknown = ws_stock_check(cfg, codes)
+        ycfg = yapi.load_config()
+        absent, already, to_zero = yahoo_store_split(ycfg, zero) if zero else ([], [], [])
+    except SystemExit as e:
+        log.warning(f"ワサビで在庫0になったSKU: 確認できないため今回はヤフーのストアへ送りません（{e}）")
+        return
+    except Exception as e:
+        log.error(f"ワサビで在庫0になったSKU: 在庫の確認に失敗しました（次回再試行）: {e}")
+        return
+    log.info(f"ワサビで在庫0になったSKU {len(codes)}件 → ヤフーのストアで0にする {len(to_zero)}件 / すでに0 {len(already)}件"
+             f" / ストアに無い {len(absent)}件" + (f" / ワサビに在庫あり（送らない） {len(in_stock)}件" if in_stock else "")
+             + (f" / ワサビに無い（送らない） {len(unknown)}件" if unknown else ""))
+    if dry or validate:
+        if to_zero:
+            log.info(f"  {'dry-run' if dry else '検証モード'}のためヤフーのストアへは送りません。例: {', '.join(to_zero[:10])}")
+        return
+    for k in absent + already + in_stock + unknown:
+        pend.pop(k, None)
+    if not to_zero:
+        return
+    try:
+        result = yapi.set_stock_zero(ycfg, to_zero)
+    except Exception as e:
+        log.error(f"ワサビで在庫0になったSKU: ヤフーのストアの在庫更新に失敗しました（次回再試行）: {e}")
+        return
+    failed = []
+    for k in to_zero:
+        err = result.get(k, "応答なし")
+        if err is None:
+            pend.pop(k, None)
+            continue
+        pend[k] += 1
+        failed.append(f"{k}（{err}）")
+        if pend[k] >= MAX_RETRY:
+            log.error(f"ヤフーのストア 在庫0 再試行の上限: {k} / {err}（手動で確認してください）")
+            pend.pop(k, None)
+    log.info(f"ヤフーのストア 結果（ワサビで在庫0の分）: 成功 {len(to_zero) - len(failed)}件 / 失敗 {len(failed)}件"
+             + (f": {', '.join(failed[:10])}" if failed else ""))
 
 
 def push_rakuten(state, cfg, dry, validate):
@@ -1007,6 +1116,7 @@ def main():
     collect_manual(state, now, dry)
     collect_yahoo_shopping(state, now)
     collect_yahoo_shopping_files(state, now, dry)
+    collect_ws_zero(state, dry or validate)
     if not dry and not validate:
         save_state(state)  # 取得した注文を先に保存（送信は未送信フラグで次回も再試行される）
 
@@ -1015,6 +1125,7 @@ def main():
         verify_amazon(state, acfg, now, dry)
     push_rakuten(state, cfg, dry, validate)
     push_yahoo_store(state, dry, validate)
+    push_ws_zero_to_yahoo(state, cfg, dry, validate)
     push_wasabi(state, dry, validate)
     if MERCARI_UPLOAD:
         mercari_list = load_mercari_products()  # メルカリの在庫ありリスト（あればメルカリはアップロード用ファイルで対応）

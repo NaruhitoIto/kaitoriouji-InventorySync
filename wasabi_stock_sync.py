@@ -267,6 +267,21 @@ def save_state(state):
     )
 
 
+ZERO_QUEUE = BASE_DIR / "ws_zero_queue.txt"  # 楽天に在庫0を送ったSKU。cross_mall_sync がヤフーのストアでも0にする
+
+
+def queue_zero_for_other_malls(skus):
+    """楽天に在庫0を送ったSKUを ws_zero_queue.txt に追記する（cross_mall_sync が受け取り、ワサビの在庫を確かめてから
+    ヤフーのストアでも0にする）。失敗しても楽天の処理は止めない。"""
+    if not skus:
+        return
+    try:
+        with open(ZERO_QUEUE, "a", encoding="utf-8") as f:
+            f.write("".join(f"{s.upper()}\n" for s in skus))
+    except OSError as e:
+        log.warning(f"ヤフーのストア用の在庫0リスト（{ZERO_QUEUE.name}）に追記できませんでした: {e}")
+
+
 CHUNK_SIZE = 5000  # 1ファイルあたりの件数
 
 
@@ -518,6 +533,7 @@ def main():
             # ファイルごとに、アップロード成功分だけ状態を更新する（失敗分は次回また送る）
             state.update(part)
             save_state(state)
+            queue_zero_for_other_malls([sku for sku, q in part.items() if q == 0])
         else:
             failed += 1
             log.error(f"アップロード失敗: {path.name}（このファイルの分は状態を更新していません）")

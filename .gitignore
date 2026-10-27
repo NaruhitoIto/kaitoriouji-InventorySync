@@ -66,3 +66,5 @@ shipping_export/出力履歴.json
 yahoo_shopping_config.ini
 yahoo_shopping_token*.json
 yahoo_public_key.pem
+ws_zero_queue.txt
+ws_zero_queue.work

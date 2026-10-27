@@ -551,6 +551,34 @@ def backfill_targets(state):
     return added
 
 
+YAHOO_LOGIN_WARN_DAYS = 7  # ヤフーのログインの期限がこの日数以内になったら、毎回ログに警告を出す
+
+
+def check_yahoo_login():
+    """ヤフーのログイン（yahoo_auth.bat）の期限が近ければ警告する。リフレッシュトークンはログインから4週間で切れ、
+    切れるとヤフーのストアへの在庫0（他で売れた分・ワサビで在庫0になった分）が止まる。"""
+    try:
+        import yahoo_shopping_api as yapi
+        ycfg = yapi.load_config()
+        deadline = yapi.reauth_deadline(ycfg)
+    except SystemExit:  # 設定ファイルが無いなど（ヤフーのストアへの送信側で別に知らせる）
+        return
+    except Exception as e:
+        log.warning(f"ヤフーのログインの期限を確認できませんでした: {e}")
+        return
+    if deadline is None:
+        log.warning("ヤフーのログイン日時が記録されていないため、ログインの期限を確認できません"
+                    "（yahoo_auth.bat でログインし直すと記録されます）")
+        return
+    left, when = deadline - time.time(), datetime.fromtimestamp(deadline, JST)
+    if left <= 0:
+        log.error(f"ヤフーのログインの期限（{when:%m/%d %H:%M} 頃）を過ぎています。yahoo_auth.bat でログインし直してください"
+                  "（ヤフーのストアへの在庫0が止まります）")
+    elif left <= YAHOO_LOGIN_WARN_DAYS * 86400:
+        log.warning(f"ヤフーのログインの期限が近づいています: {when:%m/%d %H:%M} 頃（あと {left / 86400:.1f}日）。"
+                    "yahoo_auth.bat でログインし直してください（切れるとヤフーのストアへの在庫0が止まります）")
+
+
 def yahoo_store_split(ycfg, codes):
     """ヤフーのストアの在庫参照APIで、商品コードを (ストアに無い, すでに在庫0, 在庫が残っている) に分ける。"""
     import yahoo_shopping_api as yapi
@@ -1105,6 +1133,7 @@ def main():
         return
     now = datetime.now(JST)
     log.info(f"モード: {'dry-run' if dry else '検証' if validate else '送信'} / 対象: {state['since']} 以降の注文 / 台帳 {len(state['ledger'])}件")
+    check_yahoo_login()
 
     acfg = load_amazon_config()
     cfg = ws.load_configs()

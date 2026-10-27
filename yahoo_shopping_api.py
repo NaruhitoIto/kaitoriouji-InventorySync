@@ -69,9 +69,26 @@ def load_config(env=None):
     return cfg
 
 
-def save_token(cfg, tok):
+REAUTH_SECONDS = 28 * 86400  # 公開鍵認証ありのリフレッシュトークンの有効期限（ログインから4週間）
+REAUTH_SECONDS_NO_KEY = 12 * 3600  # 公開鍵認証なしの場合（12時間）
+
+
+def save_token(cfg, tok, authorized_at=None):
+    """トークンを保存する。authorized_at は yahoo_auth.bat でログインした日時（UNIX時刻）で、更新しても引き継ぐ。"""
     tok["obtained_at"] = int(time.time())
+    if authorized_at:
+        tok["authorized_at"] = int(authorized_at)
     cfg["token_file"].write_text(json.dumps(tok, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def reauth_deadline(cfg):
+    """yahoo_auth.bat でログインし直す期限（UNIX時刻）。ログイン日時が記録されていなければ None。"""
+    if not cfg["token_file"].exists():
+        return None
+    at = json.loads(cfg["token_file"].read_text(encoding="utf-8")).get("authorized_at")
+    if not at:
+        return None
+    return at + (REAUTH_SECONDS if cfg["public_key_file"] and cfg["public_key_version"] else REAUTH_SECONDS_NO_KEY)
 
 
 def access_token(cfg):
@@ -87,7 +104,7 @@ def access_token(cfg):
         raise SystemExit(f"トークンの更新に失敗しました（HTTP {r.status_code}）。yahoo_auth.bat でログインし直してください")
     new = r.json()
     new.setdefault("refresh_token", tok["refresh_token"])
-    save_token(cfg, new)
+    save_token(cfg, new, tok.get("authorized_at"))
     return new["access_token"]
 
 

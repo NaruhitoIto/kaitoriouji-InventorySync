@@ -13,12 +13,13 @@ Yahoo!ショッピングAPIのアクセストークンを取得する（Yahoo! I
 """
 import secrets
 import sys
+import time
 import webbrowser
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
-from yahoo_shopping_api import TOKEN_URL, load_config, save_token
+from yahoo_shopping_api import TOKEN_URL, load_config, reauth_deadline, save_token
 
 AUTH_URL = "https://auth.login.yahoo.co.jp/yconnect/v2/authorization"
 
@@ -53,10 +54,14 @@ def main():
             err = {"error": r.text[:200]}
         raise SystemExit(f"トークンの取得に失敗しました（HTTP {r.status_code}）: {err.get('error')} {err.get('error_description', '')}")
     tok = r.json()
-    save_token(cfg, tok)
+    save_token(cfg, tok, authorized_at=time.time())
     print()
     print(f"トークンを保存しました: {cfg['token_file'].name}（アクセストークンの有効期限 {int(tok.get('expires_in', 0)) // 60}分。"
           f"以後はリフレッシュトークンで自動更新します）")
+    deadline = reauth_deadline(cfg)
+    if deadline:
+        print(f"次にログインし直す期限: {time.strftime('%Y/%m/%d %H:%M', time.localtime(deadline))} 頃"
+              f"（期限の7日前から、モール間在庫連携のログに警告が出ます）")
 
 
 if __name__ == "__main__":

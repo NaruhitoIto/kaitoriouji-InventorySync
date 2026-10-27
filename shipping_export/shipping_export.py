@@ -909,6 +909,131 @@ def create(cfg, since, files, use_rakuten, skip_done, hold_dupes, log, navi=()):
     return path, alerts
 
 
+# ---------------------------------------------------------------- ヤフオク店の売上明細
+
+SALES_HEADER = ["注文日時", "注文番号", "明細番号", "オークションID", "商品番号", "商品名", "数量", "単価", "小計",
+                "送料（注文）", "値引き（注文）", "ポイント利用（注文）", "注文合計", "支払方法", "入金状況", "商品番号の取得元"]
+SUMMARY_HEADER = ["商品番号", "商品名", "明細数", "数量合計", "売上合計（小計）", "最初の注文日時", "最後の注文日時", "注文番号"]
+NO_SKU = "（商品番号不明）"
+
+
+def create_sales(cfg, files, log):
+    """ヤフオク店（ストアオークション）の売上明細と、商品番号ごとの合計を CSV に出す。
+    使うファイル: 明細（default_all_items.csv）・注文データ（default_all_orders.csv）・注文CSV（download.csv）。
+    ファイルに入っている注文をすべて対象にする（期間はダウンロードするときに指定する）。
+    ヤフーショッピングの注文（商品コードが AUCTION で始まらない明細）とキャンセルされた注文は除く。
+    戻り値は (明細のファイル, 合計のファイル)。対象が無ければ (None, None)。"""
+    items, orders, dl = {}, {}, {}
+    for f in files:
+        header, rows = read_table(f)
+        if is_yahoo_items(header):
+            for r in rows:
+                if r.get("Order ID", "").strip():
+                    items[(r["Order ID"].strip(), int(num(r.get("Line ID"))))] = r
+        elif "Order ID" in header and "Order Kind" in header:
+            orders.update({r["Order ID"].strip(): r for r in rows if r.get("Order ID", "").strip()})
+        elif detect_mall(header) == "yahoo":
+            dl.update({r["OrderId"].strip(): r for r in rows if r.get("OrderId", "").strip()})
+    log(f"売上明細: 明細 {len(items)}行 / 注文データ {len(orders)}件 / 注文CSV {len(dl)}件 を読みました")
+    if not items and not dl:
+        log("売上明細: 明細ファイル（default_all_items.csv）か注文CSV（download.csv）を追加してください")
+        return None, None
+
+    lines, shopping = [], 0
+    for (oid, ln), r in items.items():
+        code = r.get("Product Code", "").strip()
+        if not code.upper().startswith("AUCTION"):
+            shopping += 1  # ヤフーショッピングの注文
+            continue
+        lines.append({"oid": oid, "line": ln, "auction": code[len("AUCTION"):], "title": r.get("Description", ""),
+                      "qty": num(r.get("Quantity")) or 1, "unit": num(r.get("Unit Price")), "sub": num(r.get("Line Sub Total"))})
+    covered = {l["oid"] for l in lines} | {oid for oid, _ in items}
+    for oid, r in dl.items():  # 明細ファイルに無い注文は注文CSVの明細（L1=…&L2=…）から作る
+        if oid in covered or not r.get("YahooAuctionId", "").strip():
+            continue
+        titles, subs = line_values(r.get("Title")), line_values(r.get("LineSubTotal"))
+        for i in range(max(len(titles), len(subs))):
+            sub = num(subs[i]) if i < len(subs) else 0
+            lines.append({"oid": oid, "line": i + 1, "auction": r["YahooAuctionId"].strip() if i == 0 else "",
+                          "title": titles[i] if i < len(titles) else "", "qty": 1, "unit": sub, "sub": sub})
+
+    out, cancelled, first = [], set(), set()
+    when_of = lambda l: parse_dt((orders.get(l["oid"]) or {}).get("Date") or (dl.get(l["oid"]) or {}).get("OrderTime"))
+    for l in sorted(lines, key=lambda l: (when_of(l) or datetime.min.replace(tzinfo=JST), l["oid"], l["line"])):
+        o, d = orders.get(l["oid"]) or {}, dl.get(l["oid"]) or {}
+        if "キャンセル" in o.get("Status", ""):
+            cancelled.add(l["oid"])
+            continue
+        sku, src = "", ""
+        found = SKU_IN_TEXT.findall(l["title"])
+        if found:
+            sku, src = found[-1].upper(), "商品名"
+        elif l["line"] == 1 and d.get("YahooAuctionMerchantId", "").strip():
+            sku, src = d["YahooAuctionMerchantId"].strip().upper(), "注文CSVの商品コード"
+        head = l["oid"] not in first  # 注文単位の金額は注文の1行目にだけ入れる（合計で二重に数えないように）
+        first.add(l["oid"])
+        if d:
+            ship, disc, total = num(d.get("ShipCharge")), abs(num(d.get("TotalMallCouponDiscount"))), num(d.get("Total"))
+        else:
+            ship, disc, total = num(o.get("Shipping")), num(o.get("Discount")), num(o.get("Total"))
+        out.append({
+            "注文日時": fmt_dt(when_of(l)), "注文番号": f"{cfg['yahoo_prefix']}{l['oid']}", "明細番号": l["line"],
+            "オークションID": l["auction"], "商品番号": sku, "商品名": l["title"], "数量": l["qty"], "単価": l["unit"],
+            "小計": l["sub"], "送料（注文）": ship if head else "", "値引き（注文）": disc if head else "",
+            "ポイント利用（注文）": num(o.get("Use Point")) if head and o else "", "注文合計": total if head else "",
+            "支払方法": d.get("PayMethodName") or o.get("Payment Method", ""),
+            "入金状況": {"1": "入金済み", "0": "未入金"}.get(d.get("PayStatus", "").strip(), ""), "商品番号の取得元": src})
+    if not out:
+        log("売上明細: ヤフオク店の明細がありません" + (f"（ヤフーショッピングの明細 {shopping}行は対象外）" if shopping else ""))
+        return None, None
+
+    missing = [r for r in out if not r["商品番号"]]
+    if missing and cfg["wasabi"]:
+        for r in missing:
+            try:
+                sku, _ = ws_find_sku(cfg["wasabi"], r["商品名"])
+            except Exception as e:  # 通信エラーなど。売上明細の作成は止めない
+                log(f"売上明細: ワサビで商品番号を探す途中でエラーになりました（{type(e).__name__}）")
+                break
+            if sku:
+                r["商品番号"], r["商品番号の取得元"] = sku.upper(), "ワサビの商品名"
+    left = [r for r in out if not r["商品番号"]]
+
+    stamp = datetime.now(JST)
+    cfg["output_dir"].mkdir(parents=True, exist_ok=True)
+    detail = cfg["output_dir"] / f"売上明細_ヤフオク店_{stamp:%Y%m%d%H%M%S}.csv"
+    with open(detail, "w", newline="", encoding="utf-8-sig") as f:  # Excel でそのまま開けるように BOM 付き
+        w = csv.DictWriter(f, fieldnames=SALES_HEADER)
+        w.writeheader()
+        w.writerows(out)
+    by = {}
+    for r in out:
+        s = by.setdefault(r["商品番号"] or NO_SKU, {"商品番号": r["商品番号"] or NO_SKU, "商品名": r["商品名"], "明細数": 0,
+                                                 "数量合計": 0, "売上合計（小計）": 0, "最初の注文日時": r["注文日時"],
+                                                 "最後の注文日時": r["注文日時"], "注文番号": []})
+        s["明細数"] += 1
+        s["数量合計"] += r["数量"]
+        s["売上合計（小計）"] += r["小計"]
+        s["最初の注文日時"] = min(s["最初の注文日時"], r["注文日時"])
+        s["最後の注文日時"] = max(s["最後の注文日時"], r["注文日時"])
+        if r["注文番号"] not in s["注文番号"]:
+            s["注文番号"].append(r["注文番号"])
+    summary = cfg["output_dir"] / f"売上集計_ヤフオク店_{stamp:%Y%m%d%H%M%S}.csv"
+    with open(summary, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=SUMMARY_HEADER)
+        w.writeheader()
+        for s in sorted(by.values(), key=lambda s: (s["商品番号"] == NO_SKU, s["商品番号"])):
+            w.writerow({**s, "注文番号": " ".join(s["注文番号"])})
+    log(f"売上明細を作成しました: {detail.name}（{len(out)}行・注文 {len(first)}件・売上 {sum(r['小計'] for r in out):,}円）"
+        + (f" / キャンセルで除外 {len(cancelled)}件" if cancelled else "")
+        + (f" / ヤフーショッピングの明細 {shopping}行は対象外" if shopping else ""))
+    log(f"商品番号ごとの合計: {summary.name}（{len(by)}商品）")
+    if left:
+        log(f"売上明細: 商品番号が分からない明細 {len(left)}行（「{NO_SKU}」にまとめました）: "
+            + ", ".join(f"{r['注文番号']}-{r['明細番号']}「{r['商品名'][:15]}」" for r in left[:10]))
+    return detail, summary
+
+
 # ---------------------------------------------------------------- 画面
 
 def main_gui():
@@ -993,6 +1118,8 @@ def main_gui():
     tk.Button(bf, text="選んだものを外す", command=remove_files).pack(side="left")
     run_btn = tk.Button(bf, text="出荷データを作成", bg="#2d6cdf", fg="white", padx=12)
     run_btn.pack(side="right")
+    sales_btn = tk.Button(bf, text="売上明細（ヤフオク店）", padx=8)
+    sales_btn.pack(side="right", padx=6)
     tk.Button(bf, text="出力フォルダを開く", command=lambda: (cfg["output_dir"].mkdir(parents=True, exist_ok=True),
                                                          os.startfile(cfg["output_dir"]))).pack(side="right", padx=6)
 
@@ -1041,6 +1168,30 @@ def main_gui():
         threading.Thread(target=work, daemon=True).start()
 
     run_btn.configure(command=run)
+
+    def run_sales():
+        paths = [f for f in files if isinstance(f, str)]
+        if not paths:
+            messagebox.showerror(APP_NAME, "ヤフオク店の明細ファイル（default_all_items.csv）・注文データ（default_all_orders.csv）・"
+                                           "注文CSV（download.csv）を「注文ファイルを追加…」で追加してください")
+            return
+        sales_btn.configure(state="disabled")
+
+        def work():
+            try:
+                detail, summary = create_sales(cfg, paths, log)
+                if detail:
+                    root.after(0, lambda: messagebox.showinfo(APP_NAME, f"売上明細を作成しました。\n{detail}\n{summary}"))
+            except Exception as e:
+                log(f"エラー: {e}")
+                log(traceback.format_exc())
+                root.after(0, lambda: messagebox.showerror(APP_NAME, f"エラーが発生しました。\n{e}"))
+            finally:
+                root.after(0, lambda: sales_btn.configure(state="normal"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    sales_btn.configure(command=run_sales)
     log(f"設定ファイル: {CONFIG_FILE}")
     log(f"出力先: {cfg['output_dir']}")
     if not (cfg["rakuten_secret"] and cfg["rakuten_key"]):

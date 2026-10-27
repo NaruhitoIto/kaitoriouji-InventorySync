@@ -5,14 +5,19 @@
   楽天の注文（RMS API）              → Amazon・ヤフーのストアの在庫を0（Listings API / 在庫更新API）
   Amazonの注文（SP-API）             → 楽天・ヤフーのストアの在庫を0（RMS 在庫CSV を SFTP / 在庫更新API）
   メルカリ・ヤフオクの注文（手動ファイル）→ 楽天・Amazon・ヤフーのストアの在庫を0
+  ヤフーショッピングの注文（注文API、承認されるまでは手動ファイル）→ ワサビ・楽天・Amazon の在庫を0
   どこかで売れたSKU                  → メルカリ・ヤフオクで手動で止める一覧（todo/）を作る
 
 在庫は「0にする」方向しか送らない（売れた1点物を止めるだけ）。キャンセル・返品で戻すのは手動。
 WS の状態ファイル（wasabi_stock_state.json）は読むだけで変更しない（WS 復旧後の処理を壊さないため）。
+ワサビの在庫は、ヤフーショッピングで売れた分だけ FTP（/stock_import）で0にする（ワサビ自身のヤフーの注文の
+取り込みが1〜2日遅れるため。ワサビからメルカリ・ラクマなどにも伝わる）。ワサビが復旧した後も、この分のために動かしておく。
 
 手動ファイルの置き場所（処理後は done/ に移動）:
   inbox/mercari/  メルカリShopsの注文CSV、またはSKUを1行に1つ書いたテキスト
   inbox/yahoo/    ヤフオクの注文（落札）CSV、またはSKUを1行に1つ書いたテキスト
+  inbox/yahoo_shopping/  ストアクリエイターProの注文データの明細（default_all_items.csv）。注文（default_all_orders.csv）も
+                  一緒に置くとキャンセルを除く。ストアオークション（AUCTION…）の明細は使わない
   CSV は見出しに「商品管理コード / 商品番号 / SKU / 管理番号」などがあればその列を、無ければ
   すべての欄から商品番号の形（例 260908SK040605）を探して読む。注文者情報は読まない・記録しない。
 
@@ -39,6 +44,7 @@ WS の状態ファイル（wasabi_stock_state.json）は読むだけで変更し
 import base64
 import configparser
 import csv
+import ftplib
 import io
 import json
 import logging
@@ -64,11 +70,17 @@ RAKUTEN_CFG = BASE_DIR / "rakuten_api_config.ini"
 OVERLAP = timedelta(minutes=10)      # 取得期間を前回と少し重ねる（注文番号で重複は除く）
 AMAZON_ACTIVE = "Pending,Unshipped,PartiallyShipped,Shipped"
 RAKUTEN_CANCEL = {"700", "800", "900"}
-AUTO_TARGETS = ("rakuten", "amazon", "yahoo_store")  # API で自動的に0にするモール
+AUTO_TARGETS = ("rakuten", "amazon", "yahoo_store", "wasabi")  # API・FTP で自動的に0にする送り先
 # 送り先ごとに「この売れたモールなら送らない」（ヤフーのストアで売れた分はヤフー側で在庫が減る）
 SKIP_SOURCES = {"yahoo_store": {"yahoo"}}
+# 送り先ごとに「この売れたモールの分だけ送る」。ワサビは楽天の注文（rakuten_orders_sync）や Amazon・メルカリの注文
+# （ワサビ自身が取り込む）をすでに知っているため、取り込みが1〜2日遅れるヤフーショッピングの分だけ送る
+ONLY_SOURCES = {"wasabi": {"yahoo_store"}}
 MANUAL_MALLS = {"mercari": "メルカリ", "yahoo": "ヤフオク"}  # 手動で止めるモール（一覧を作る）
-MALL_LABEL = {"rakuten": "楽天", "amazon": "Amazon", "yahoo_store": "ヤフーのストア", **MANUAL_MALLS}
+MALL_LABEL = {"rakuten": "楽天", "amazon": "Amazon", "yahoo_store": "ヤフーショッピング", "wasabi": "ワサビ", **MANUAL_MALLS}
+WASABI_FTP_CFG = BASE_DIR / "wasabi_ftp_config.ini"
+YAHOO_SHOPPING_INBOX = INBOX / "yahoo_shopping"  # ヤフーショッピングの明細ファイル（default_all_items.csv）を置く
+YAHOO_LOOKBACK = timedelta(days=2)  # 注文APIが使えるようになった最初の回などに、さかのぼって注文を取る上限
 MALLS_LIKE_RAKUTEN = {"mercari"}  # 楽天と同じ商品を出品している想定のモール（止める一覧を楽天の出品で絞る）
 TODO_STOPPED = {"yahoo", "mercari"}  # 止める一覧・アップロード用ファイルを作らないモール
 # （ヤフオクは在庫連携をやめた。メルカリはワサビの連携が再開した。注文ファイルを置けば他モールの在庫0はする）
@@ -148,6 +160,12 @@ def save_state(state):
     raise RuntimeError("cross_mall_state.json を保存できませんでした")
 
 
+def targets_for(src):
+    """そのモールで売れたSKUを在庫0にする送り先。"""
+    return [t for t in AUTO_TARGETS
+            if t != src and src not in SKIP_SOURCES.get(t, ()) and src in ONLY_SOURCES.get(t, {src})]
+
+
 def add_sold(state, sku, src, order_id, at):
     """売れたSKUを台帳に追加する。すでにあれば何もしない（最初に売れたモールを残す）。"""
     key = norm(sku)
@@ -162,9 +180,8 @@ def add_sold(state, sku, src, order_id, at):
                         f"{MALL_LABEL[src]}（{order_id}）で売れています")
         return False
     entry = {"src": src, "order": order_id, "at": at, "push": {}, "tries": {}, "todo": {}}
-    for t in AUTO_TARGETS:
-        if t != src and src not in SKIP_SOURCES.get(t, ()):
-            entry["push"][t] = None  # None = 未送信
+    for t in targets_for(src):
+        entry["push"][t] = None  # None = 未送信
     for m in MANUAL_MALLS:
         if m != src:
             entry["todo"][m] = None  # None = まだ一覧に出していない
@@ -392,6 +409,128 @@ def collect_manual(state, now, dry):
                 shutil.move(str(path), str(folder / "done" / f"{now:%Y%m%d_%H%M%S}_{path.name}"))
 
 
+# ---------- ヤフーショッピング（注文取得） ----------
+
+def yahoo_sku(code):
+    """ヤフーショッピングの商品コードから商品番号を取り出す。ストアオークション（AUCTION…）や形の違うものは ""。"""
+    if code.upper().startswith("AUCTION"):
+        return ""
+    m = SKU_RE.search(code)
+    return m.group(1) if m else ""
+
+
+def collect_yahoo_shopping(state, now):
+    """ヤフーショッピングの注文を注文API（注文検索・注文詳細）で取る。
+    注文APIがまだ使えない（利用申請の承認待ち）ときは何もせず、使えるようになったら自動で始まる。"""
+    st = state.setdefault("yahoo_store", {"last_checked": now.isoformat(), "processed": []})
+    start = max(datetime.fromisoformat(st["last_checked"]) - OVERLAP, now - YAHOO_LOOKBACK)
+    try:
+        import yahoo_shopping_api as yapi
+        ycfg = yapi.load_config()
+        orders = yapi.order_list(ycfg, start, now)
+    except SystemExit as e:  # 設定ファイルが無いなど
+        log.warning(f"ヤフーショッピングの注文: 設定を読めないため取得しません（{e}）")
+        return
+    except Exception as e:
+        if getattr(e, "code", "") == "px-04306":
+            log.info("ヤフーショッピングの注文: 注文APIがまだ使えないため取得しません（px-04306。利用申請の承認待ち）")
+        else:
+            log.error(f"ヤフーショッピングの注文: 取得に失敗しました（次回再試行）: {e}")
+        return
+    processed, new, added, cancelled, auction, odd, complete = set(st["processed"]), [], 0, 0, 0, [], True
+    for oid, _, status in orders:
+        if not oid or oid in processed:
+            continue
+        if status != "4":  # キャンセル以外は注文詳細で商品コードを見る
+            try:
+                time.sleep(1)  # 1クエリー/秒
+                status, items = yapi.order_items(ycfg, oid)
+            except Exception as e:
+                log.error(f"ヤフーショッピングの注文 {oid}: 注文詳細を取得できませんでした（次回再試行）: {e}")
+                complete = False
+                break
+        if status == "4":
+            cancelled += 1
+        else:
+            for code, _, _ in items:
+                sku = yahoo_sku(code)
+                if sku:
+                    added += add_sold(state, sku, "yahoo_store", oid, now.isoformat())
+                elif code.upper().startswith("AUCTION"):
+                    auction += 1  # ストアオークション（ヤフオク店）の明細は対象外
+                else:
+                    odd.append(f"{oid}:{code}")
+        new.append(oid)
+    st["processed"] = (st["processed"] + new)[-20000:]
+    if complete:
+        st["last_checked"] = now.isoformat()
+    log.info(f"ヤフーショッピングの注文: 取得 {len(orders)}件 / 新規 {len(new)}件 / 新たに売れたSKU {added}件"
+             + (f" / キャンセル {cancelled}件" if cancelled else "") + (f" / ヤフオク店の明細 {auction}件は対象外" if auction else ""))
+    if odd:
+        log.warning(f"ヤフーショッピング: 商品番号の形でない商品コード {len(odd)}件は在庫0にしていません: {', '.join(odd[:10])}")
+
+
+def collect_yahoo_shopping_files(state, now, dry):
+    """inbox/yahoo_shopping/ に置いたストアクリエイターProの注文データから、ヤフーショッピングで売れたSKUを取る
+    （注文APIが使えるようになるまでの代わり）。明細（default_all_items.csv）の商品コード（Product Code）を使い、
+    ストアオークション（AUCTION…）の明細は使わない。注文（default_all_orders.csv）も一緒に置けば、キャンセルされた注文と
+    開始時刻より前の注文を除く。ほかの手動ファイルと同じく、SKUを1行に1つ書いたテキストなども読める。処理後は done/ へ移す。"""
+    folder = YAHOO_SHOPPING_INBOX
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "done").mkdir(exist_ok=True)
+    paths = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in (".csv", ".txt", ".tsv"))
+    if not paths:
+        return
+    since = datetime.fromisoformat(state["since"])
+    items_files, orders, order_paths, others = [], {}, [], []
+    for p in paths:
+        reader = csv.DictReader(io.StringIO(read_text_any(p)))
+        fields = set(reader.fieldnames or [])
+        if {"Order ID", "Line ID", "Product Code"} <= fields:
+            items_files.append((p, list(reader)))
+        elif {"Order ID", "Status", "Date"} <= fields:
+            orders.update({r["Order ID"].strip(): r for r in reader if (r.get("Order ID") or "").strip()})
+            order_paths.append(p)
+        else:
+            others.append(p)
+    for p, rows in items_files:
+        found, added, auction, cancelled, old, odd = 0, 0, 0, 0, 0, []
+        for r in rows:
+            oid, code = (r.get("Order ID") or "").strip(), (r.get("Product Code") or "").strip()
+            if code.upper().startswith("AUCTION"):
+                auction += 1
+                continue
+            o = orders.get(oid) or {}
+            t = parse_order_time(o.get("Date"))
+            if "キャンセル" in (o.get("Status") or ""):
+                cancelled += 1
+            elif t and t < since:
+                old += 1
+            elif yahoo_sku(code):
+                found += 1
+                added += add_sold(state, yahoo_sku(code), "yahoo_store", oid, now.isoformat())
+            else:
+                odd.append(f"{oid}:{code}")
+        log.info(f"ヤフーショッピングの明細ファイル {p.name}: ヤフーショッピングの明細 {found}件 / 新たに売れたSKU {added}件"
+                 + (f" / キャンセル {cancelled}件" if cancelled else "") + (f" / {since:%m/%d %H:%M} より前 {old}件" if old else "")
+                 + (f" / ヤフオク店の明細 {auction}件は対象外" if auction else ""))
+        if not orders:
+            log.info("  注文データ（default_all_orders.csv）が無いため、キャンセルと注文日時では除いていません")
+        if odd:
+            log.warning(f"  商品番号の形でない商品コード {len(odd)}件は在庫0にしていません: {', '.join(odd[:10])}")
+    for p in others:
+        pairs = parse_manual_file(p, since)
+        added = sum(add_sold(state, s, "yahoo_store", o or p.name, now.isoformat()) for s, o in pairs)
+        log.info(f"ヤフーショッピングの手動ファイル {p.name}: SKU {len(pairs)}件 / 新たに売れたSKU {added}件")
+    if order_paths and not items_files:
+        # 注文データだけでは商品コードが分からない。明細が置かれるまで残しておく
+        log.warning("ヤフーショッピング: 注文データだけでは商品コードが分かりません。明細（default_all_items.csv）も置いてください")
+        paths = [p for p in paths if p not in order_paths]
+    if not dry:
+        for p in paths:
+            shutil.move(str(p), str(folder / "done" / f"{now:%Y%m%d_%H%M%S}_{p.name}"))
+
+
 # ---------- 送信 ----------
 
 def pending(state, target):
@@ -404,8 +543,8 @@ def backfill_targets(state):
     """送り先を後から追加したとき、既存の台帳にもその送り先を「未送信」として加える。"""
     added = 0
     for e in state["ledger"].values():
-        for t in AUTO_TARGETS:
-            if t not in e["push"] and t != e["src"] and e["src"] not in SKIP_SOURCES.get(t, ()):
+        for t in targets_for(e["src"]):
+            if t not in e["push"]:
                 e["push"][t] = None
                 added += 1
     return added
@@ -465,6 +604,46 @@ def push_yahoo_store(state, dry, validate):
             failed += 1
             log.error(f"ヤフーのストア 在庫0 失敗: {k} / {err}")
     log.info(f"ヤフーのストア 結果: 成功 {len(to_zero) - failed}件 / 失敗 {failed}件")
+
+
+def push_wasabi(state, dry, validate):
+    """ワサビの在庫を0にする。楽天の注文（rakuten_orders_sync）と同じく、FTP の /stock_import に「u,商品番号,0」の
+    CSV を送る。ワサビが連携しているメルカリ・ラクマなどにもワサビから伝わる。"""
+    todo = pending(state, "wasabi")
+    if not todo:
+        return
+    log.info(f"ワサビへ在庫0: {len(todo)}件")
+    if dry or validate:
+        log.info(f"  {'dry-run' if dry else '検証モード'}のためワサビへは送りません。例: {', '.join(todo[:10])}")
+        return
+    c = configparser.ConfigParser()
+    c.read(WASABI_FTP_CFG, encoding="utf-8")
+    if not c.has_section("WASABI_FTP"):
+        log.error(f"ワサビ: {WASABI_FTP_CFG.name} に [WASABI_FTP] が無いため送れません")
+        return
+    wf = c["WASABI_FTP"]
+    now = datetime.now(JST)
+    path = ws.OUT_DIR / f"wasabi_stock_yahoo_{now:%Y%m%d_%H%M%S}.csv"
+    eol = "\r\n" if wf.get("newline", "LF").upper() == "CRLF" else "\n"
+    lines = ["コントロールカラム,商品番号,在庫数"] + [f"u,{k},0" for k in sorted(todo)]
+    path.write_bytes((eol.join(lines) + eol).encode("cp932", errors="replace"))
+    result = now.isoformat()
+    try:
+        with ftplib.FTP() as ftp:  # 一時名で送ってから正式名にする（取り込みの途中読みを防ぐ）
+            ftp.connect(wf["host"], int(wf.get("port", "21") or 21), timeout=60)
+            ftp.login(wf["username"], wf["password"])
+            ftp.cwd(wf["remote_dir"])
+            with open(path, "rb") as f:
+                ftp.storbinary(f"STOR {path.name}.tmp", f)
+            ftp.rename(f"{path.name}.tmp", path.name)
+        log.info(f"ワサビFTPへ送信: {wf['remote_dir']}/{path.name}（{len(todo)}件）")
+    except Exception as e:
+        result = f"error:FTP {type(e).__name__}"
+        log.error(f"ワサビFTPへの送信に失敗しました（次回再試行）: {e}")
+    for k in todo:
+        e = state["ledger"][k]
+        e["tries"]["wasabi"] = e["tries"].get("wasabi", 0) + 1
+        e["push"]["wasabi"] = result
 
 
 def push_rakuten(state, cfg, dry, validate):
@@ -826,6 +1005,8 @@ def main():
     collect_rakuten(state, now, dry)
     collect_amazon(state, acfg, now)
     collect_manual(state, now, dry)
+    collect_yahoo_shopping(state, now)
+    collect_yahoo_shopping_files(state, now, dry)
     if not dry and not validate:
         save_state(state)  # 取得した注文を先に保存（送信は未送信フラグで次回も再試行される）
 
@@ -834,6 +1015,7 @@ def main():
         verify_amazon(state, acfg, now, dry)
     push_rakuten(state, cfg, dry, validate)
     push_yahoo_store(state, dry, validate)
+    push_wasabi(state, dry, validate)
     if MERCARI_UPLOAD:
         mercari_list = load_mercari_products()  # メルカリの在庫ありリスト（あればメルカリはアップロード用ファイルで対応）
         write_todo(state, now, dry or validate, upload_malls={"mercari"} if mercari_list[0] is not None else set())

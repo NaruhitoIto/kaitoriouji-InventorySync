@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Yahoo!ショッピングAPIの共通部品（設定・トークン・公開鍵署名・在庫API）。単体では実行しない。
+Yahoo!ショッピングAPIの共通部品（設定・トークン・公開鍵署名・在庫API・注文API）。単体では実行しない。
 
 設定: yahoo_shopping_config.ini
   [YAHOO_SHOPPING]       普段使う設定（environment = production / test）
@@ -169,6 +169,53 @@ def error_of(resp):
     if err is None:
         return "", ""
     return err.findtext("Code") or "", err.findtext("Message") or ""
+
+
+class ApiError(RuntimeError):
+    """API のエラー応答。status は HTTP ステータス、code は px-04306 などのエラーコード。"""
+
+    def __init__(self, api, resp):
+        self.status = resp.status_code
+        self.code, msg = error_of(resp)
+        super().__init__(f"{api} HTTP {self.status} {self.code}: {msg}")
+
+
+# ---------------------------------------------------------------- 注文API（利用申請の承認が必要）
+
+def order_list(cfg, start, end):
+    """注文検索API。注文日時が start〜end の注文を [(注文ID, 注文日時, 注文ステータス)] で返す（古い順）。
+    注文IDは「ストアアカウント-番号」（例 vivoage-10216169）。注文ステータス 4 はキャンセル。"""
+    out, pos = [], 1
+    while True:
+        xml = (f"<Req><Search><Result>500</Result><Start>{pos}</Start><Sort>+order_time</Sort>"
+               f"<Condition><OrderTimeFrom>{start:%Y%m%d%H%M%S}</OrderTimeFrom><OrderTimeTo>{end:%Y%m%d%H%M%S}</OrderTimeTo>"
+               f"</Condition><Field>OrderId,OrderTime,OrderStatus</Field></Search>"
+               f"<SellerId>{cfg['seller_id']}</SellerId></Req>")
+        r = call(cfg, "orderList", xml=xml)
+        if r.status_code != 200:
+            raise ApiError("orderList", r)
+        root = ET.fromstring(r.content)
+        infos = list(root.iter("OrderInfo"))
+        out += [(o.findtext("OrderId") or "", o.findtext("OrderTime") or "", o.findtext("OrderStatus") or "") for o in infos]
+        pos += len(infos)
+        if not infos or pos > int(root.findtext(".//TotalCount") or 0):
+            return out
+        time.sleep(1)  # 1クエリー/秒
+
+
+def order_items(cfg, order_id):
+    """注文詳細API。(注文ステータス, [(商品コード, サブコード, 数量)]) を返す。"""
+    xml = (f"<Req><Target><OrderId>{order_id}</OrderId><Field>OrderId,OrderStatus,LineId,ItemId,SubCode,Quantity</Field>"
+           f"</Target><SellerId>{cfg['seller_id']}</SellerId></Req>")
+    r = call(cfg, "orderInfo", xml=xml)
+    if r.status_code != 200:
+        raise ApiError("orderInfo", r)
+    info = ET.fromstring(r.content).find(".//OrderInfo")
+    if info is None:
+        raise RuntimeError(f"orderInfo: {order_id} の注文情報がありません")
+    return info.findtext("OrderStatus") or "", [
+        ((it.findtext("ItemId") or "").strip(), (it.findtext("SubCode") or "").strip(), (it.findtext("Quantity") or "").strip())
+        for it in info.iter("Item")]
 
 
 def get_stock(cfg, item_codes):

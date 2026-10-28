@@ -29,6 +29,8 @@ jobs:
         env:
           WASABI_AUTH: ${{ secrets.WASABI_AUTH }}
           WINDOW_DAYS: ${{ github.event.inputs.window_days }}
+          RAKUTEN_SERVICE_SECRET: ${{ secrets.RAKUTEN_SERVICE_SECRET }}
+          RAKUTEN_LICENSE_KEY: ${{ secrets.RAKUTEN_LICENSE_KEY }}
 
       - run: |
           git config user.name "github-actions[bot]"

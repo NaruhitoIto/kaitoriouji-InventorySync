@@ -5,7 +5,13 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+import rakuten_rms
+
 BASE = "https://world-switch.com/kaitoriouji/ext"
+RAKUTEN_SHOP_ID = 1
+# この日付以降は楽天(id:1)をRMS APIの値で差し替える。
+# それより前の日付はWASABIの値を残し、RMSの値はログに比較表示するだけ。
+RAKUTEN_FROM = os.environ.get("RAKUTEN_FROM") or "2026-10-17"
 AUTH = os.environ["WASABI_AUTH"]
 HEADERS = {"Authorization": f"Bearer {AUTH}"}
 SHOP_IDS = [1, 4, 5, 6, 8, 11, 20, 22, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34]
@@ -113,6 +119,31 @@ def main():
             "shipped_count": int(s["total_order"]),
             "shops": shops,
         }
+
+    if rakuten_rms.enabled():
+        for d, doc in docs.items():
+            try:
+                r = rakuten_rms.fetch_day(d)
+            except Exception as e:
+                # 失敗した日はWASABIの値のまま(ダッシュボードを悪化させない)
+                print(f"rakuten {d}: skipped ({e})")
+                continue
+            s = next(x for x in doc["shops"] if x["id"] == RAKUTEN_SHOP_ID)
+            if d < RAKUTEN_FROM:
+                print(f"rakuten verify {d}: WASABI ordered={s['ordered']} count={s.get('count')} qty={s['qty']} "
+                      f"shipped={s['shipped']} | RMS {r['candidates']} count={r['count']} qty={r['qty']} "
+                      f"shipped={r['shipped']}")
+                continue
+            doc["ordered_total"] += r["ordered"] - s["ordered"]
+            doc["ordered_qty"] += r["qty"] - s["qty"]
+            doc["ordered_count"] += r["count"] - s.get("count", 0)
+            if s["shipped"] == 0:
+                doc["shipped_count"] += r["shipped_count"]
+            doc["shipped_total"] += r["shipped"] - s["shipped"]
+            s.update(ordered=r["ordered"], qty=r["qty"], count=r["count"], shipped=r["shipped"])
+            print(f"rakuten {d}: ordered={r['ordered']} count={r['count']} qty={r['qty']} shipped={r['shipped']}")
+    else:
+        print("rakuten: RAKUTEN_SERVICE_SECRET / RAKUTEN_LICENSE_KEY not set, using WASABI values")
 
     out = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

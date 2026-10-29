@@ -6,6 +6,7 @@
   Amazonの注文（SP-API）             → 楽天・ヤフーのストアの在庫を0（RMS 在庫CSV を SFTP / 在庫更新API）
   メルカリ・ヤフオクの注文（手動ファイル）→ 楽天・Amazon・ヤフーのストアの在庫を0
   ヤフーショッピングの注文（注文API、承認されるまでは手動ファイル）→ ワサビ・楽天・Amazon の在庫を0
+  ヤフオク店（ストアオークション）の注文（同じ注文API。商品名から商品番号を探す）→ ワサビ・楽天・Amazon・ヤフーのストアの在庫を0
   どこかで売れたSKU                  → メルカリ・ヤフオクで手動で止める一覧（todo/）を作る
   ワサビで在庫0になったSKU（毎時の wasabi_stock_sync が ws_zero_queue.txt に書く）→ ヤフーのストアの在庫を0
 
@@ -76,12 +77,14 @@ AUTO_TARGETS = ("rakuten", "amazon", "yahoo_store", "wasabi")  # API・FTP で�
 SKIP_SOURCES = {"yahoo_store": {"yahoo"}}
 # 送り先ごとに「この売れたモールの分だけ送る」。ワサビは楽天の注文（rakuten_orders_sync）や Amazon・メルカリの注文
 # （ワサビ自身が取り込む）をすでに知っているため、取り込みが1〜2日遅れるヤフーショッピングの分だけ送る
-ONLY_SOURCES = {"wasabi": {"yahoo_store"}}
+ONLY_SOURCES = {"wasabi": {"yahoo_store", "yahoo_auction"}}
 MANUAL_MALLS = {"mercari": "メルカリ", "yahoo": "ヤフオク"}  # 手動で止めるモール（一覧を作る）
-MALL_LABEL = {"rakuten": "楽天", "amazon": "Amazon", "yahoo_store": "ヤフーショッピング", "wasabi": "ワサビ", **MANUAL_MALLS}
+MALL_LABEL = {"rakuten": "楽天", "amazon": "Amazon", "yahoo_store": "ヤフーショッピング", "yahoo_auction": "ヤフオク店",
+              "wasabi": "ワサビ", **MANUAL_MALLS}
 WASABI_FTP_CFG = BASE_DIR / "wasabi_ftp_config.ini"
 YAHOO_SHOPPING_INBOX = INBOX / "yahoo_shopping"  # ヤフーショッピングの明細ファイル（default_all_items.csv）を置く
 YAHOO_LOOKBACK = timedelta(days=2)  # 注文APIが使えるようになった最初の回などに、さかのぼって注文を取る上限
+AUCTION_BACKFILL = timedelta(days=3)  # ストアオークションに対応する前に処理した注文を、最初の1回だけ見直す期間
 MALLS_LIKE_RAKUTEN = {"mercari"}  # 楽天と同じ商品を出品している想定のモール（止める一覧を楽天の出品で絞る）
 TODO_STOPPED = {"yahoo", "mercari"}  # 止める一覧・アップロード用ファイルを作らないモール
 # （ヤフオクは在庫連携をやめた。メルカリはワサビの連携が再開した。注文ファイルを置けば他モールの在庫0はする）
@@ -420,11 +423,58 @@ def yahoo_sku(code):
     return m.group(1) if m else ""
 
 
-def collect_yahoo_shopping(state, now):
+AUCTION_CODE = re.compile(r"^([A-Za-z]?\d{3}-(\d{4})(?:-\d{2})?)(?=\s)")  # タイトル先頭の管理番号（例 m791-0260-32、336-0494）
+
+
+def auction_skus(wcfg, title):
+    """ストアオークション（ヤフオク店）の明細の商品名から、売れた商品番号を探す。戻り値は (商品番号のリスト, 理由)。
+    商品名に商品番号が入っていればそれを使う。無ければワサビの「ヤフー｜商品名」か「表示用商品名」（本・CDは先頭に
+    【中古】が付く）が同じ商品、それも無ければ先頭の管理番号で始まり、商品番号の末尾4桁が管理番号の真ん中の4桁と同じ商品。
+    1件ならそれ。同じ本が何冊もあるときは、在庫が残っているのが1件ならそれ、全部在庫0ならすでに止まっているので []。
+    見つからない・在庫ありが2件以上で決められないときは None。"""
+    skus = list(dict.fromkeys(s.upper() for s in SKU_RE.findall(title)))
+    if skus:
+        return skus, "商品名の商品番号"
+    title = title.strip()
+    if not title:
+        return None, "商品名なし"
+    m = AUCTION_CODE.match(title)
+    tries = [(f, "includes", title, lambda it, f=f: re.sub(r"^【中古】\s*", "", str(it.get(f) or "").strip()) == title)
+             for f in ("ヤフー｜商品名", "表示用商品名")]
+    if m:
+        tries += [(f, "starts", m.group(1), lambda it: str(it.get("商品番号") or "").endswith(m.group(2)))
+                  for f in ("ヤフー｜商品名", "表示用商品名")]
+    same, data, items = [], {}, []
+    for field, op, value, ok in tries:
+        data = ws.fetch_page(wcfg, 1, {field: {op: value}})
+        time.sleep(0.4)
+        items = data.get("data", [])
+        same = [it for it in items if ok(it)]
+        if same:
+            break
+    if not same:
+        return None, "ワサビに同じ商品名なし"
+    if len(same) == 1:
+        return [norm(str(same[0].get("商品番号") or ""))], "ワサビの商品名"
+    if (data.get("total") or 0) > len(items):
+        return None, f"ワサビに同じ商品名が多すぎる（{data.get('total')}件）"
+    in_stock = [norm(str(it.get("商品番号") or "")) for it in same if ws.parse_stock(it.get("在庫数")) != 0]
+    if len(in_stock) <= 1:
+        return in_stock, f"ワサビに同じ商品名{len(same)}件・在庫あり{len(in_stock)}件"
+    return None, f"ワサビに同じ商品名で在庫ありが{len(in_stock)}件（{', '.join(in_stock[:5])}）"
+
+
+def collect_yahoo_shopping(state, now, wcfg):
     """ヤフーショッピングの注文を注文API（注文検索・注文詳細）で取る。
-    注文APIがまだ使えない（利用申請の承認待ち）ときは何もせず、使えるようになったら自動で始まる。"""
+    注文APIがまだ使えない（利用申請の承認待ち）ときは何もせず、使えるようになったら自動で始まる。
+    同じ注文管理に入るストアオークション（ヤフオク店）の明細は、商品コードが AUCTION… で商品番号が無いため、
+    商品名から商品番号を探して（auction_skus）他のモールでも在庫0にする。対応前に処理した注文は、
+    最初の1回だけ AUCTION_BACKFILL さかのぼってストアオークションの明細を見直す。"""
     st = state.setdefault("yahoo_store", {"last_checked": now.isoformat(), "processed": []})
     start = max(datetime.fromisoformat(st["last_checked"]) - OVERLAP, now - YAHOO_LOOKBACK)
+    backfill = "auction_from" not in st
+    if backfill:
+        start = min(start, now - AUCTION_BACKFILL)
     try:
         import yahoo_shopping_api as yapi
         ycfg = yapi.load_config()
@@ -438,35 +488,59 @@ def collect_yahoo_shopping(state, now):
         else:
             log.error(f"ヤフーショッピングの注文: 取得に失敗しました（次回再試行）: {e}")
         return
-    processed, new, added, cancelled, auction, odd, complete = set(st["processed"]), [], 0, 0, 0, [], True
+    processed, new, added, cancelled, odd, complete = set(st["processed"]), [], 0, 0, [], True
+    auction, auction_added, auction_stopped, unmatched = 0, 0, 0, []
     for oid, _, status in orders:
-        if not oid or oid in processed:
+        redo = oid in processed  # 対応前に処理した注文は、ストアオークションの明細だけを見直す
+        if not oid or (redo and not backfill):
             continue
-        if status != "4":  # キャンセル以外は注文詳細で商品コードを見る
-            try:
+        items, found = [], []
+        try:
+            if status != "4":  # キャンセル以外は注文詳細で商品コードを見る
                 time.sleep(1)  # 1クエリー/秒
                 status, items = yapi.order_items(ycfg, oid)
-            except Exception as e:
-                log.error(f"ヤフーショッピングの注文 {oid}: 注文詳細を取得できませんでした（次回再試行）: {e}")
-                complete = False
-                break
-        if status == "4":
+            if status != "4":
+                for code, _, _, title in items:
+                    is_auction = code.upper().startswith("AUCTION")
+                    if is_auction or not redo:
+                        found.append((code, title, auction_skus(wcfg, title) if is_auction else None))
+        except Exception as e:
+            log.error(f"ヤフーショッピングの注文 {oid}: 明細を確かめられませんでした（次回再試行）: {e}")
+            complete = False
+            break
+        if status == "4" and not redo:
             cancelled += 1
-        else:
-            for code, _, _ in items:
+        for code, title, auc in found:
+            if auc is None:  # ヤフーショッピングの明細
                 sku = yahoo_sku(code)
                 if sku:
                     added += add_sold(state, sku, "yahoo_store", oid, now.isoformat())
-                elif code.upper().startswith("AUCTION"):
-                    auction += 1  # ストアオークション（ヤフオク店）の明細は対象外
                 else:
                     odd.append(f"{oid}:{code}")
-        new.append(oid)
+                continue
+            auction += 1
+            skus, why = auc
+            if skus is None:
+                unmatched.append(f"{oid} {title[:30]}（{why}）")
+            elif not skus:
+                auction_stopped += 1
+            for sku in skus or []:
+                auction_added += add_sold(state, sku, "yahoo_auction", oid, now.isoformat())
+        if not redo:
+            new.append(oid)
     st["processed"] = (st["processed"] + new)[-20000:]
     if complete:
         st["last_checked"] = now.isoformat()
+        if backfill:
+            st["auction_from"] = start.isoformat()  # ここから後のストアオークションの明細は見た
     log.info(f"ヤフーショッピングの注文: 取得 {len(orders)}件 / 新規 {len(new)}件 / 新たに売れたSKU {added}件"
-             + (f" / キャンセル {cancelled}件" if cancelled else "") + (f" / ヤフオク店の明細 {auction}件は対象外" if auction else ""))
+             + (f" / キャンセル {cancelled}件" if cancelled else ""))
+    if auction:
+        log.info(f"ヤフオク店（ストアオークション）の明細 {auction}件{'（対応前の注文の見直しを含む）' if backfill else ''}: "
+                 f"新たに売れたSKU {auction_added}件" + (f" / 同じ商品名がすべて在庫0 {auction_stopped}件" if auction_stopped else ""))
+    if unmatched:
+        log.warning(f"ヤフオク店: 商品番号を決められず在庫0にしていない明細 {len(unmatched)}件（手動で確認してください）: "
+                    + " / ".join(unmatched[:20]))
     if odd:
         log.warning(f"ヤフーショッピング: 商品番号の形でない商品コード {len(odd)}件は在庫0にしていません: {', '.join(odd[:10])}")
 
@@ -1143,7 +1217,7 @@ def main():
     collect_rakuten(state, now, dry)
     collect_amazon(state, acfg, now)
     collect_manual(state, now, dry)
-    collect_yahoo_shopping(state, now)
+    collect_yahoo_shopping(state, now, cfg)
     collect_yahoo_shopping_files(state, now, dry)
     collect_ws_zero(state, dry or validate)
     if not dry and not validate:

@@ -18,6 +18,7 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -25,35 +26,40 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "yahoo_shopping_config.ini"
 TOKEN_URL = "https://auth.login.yahoo.co.jp/yconnect/v2/token"
+JST = timezone(timedelta(hours=9))
 HOSTS = {"production": "https://circus.shopping.yahooapis.jp", "test": "https://test.circus.shopping.yahooapis.jp"}
 
 
 # ---------------------------------------------------------------- 設定・トークン
 
-PUBLIC_KEY_FILE = BASE_DIR / "yahoo_public_key.pem"
+PUBLIC_KEY_NAME = "yahoo_public_key.pem"
 PEM_BLOCK = re.compile(r"-----BEGIN PUBLIC KEY-----.*?-----END PUBLIC KEY-----", re.S)
 
 
-def _config_text():
+def _config_text(config_file):
     """設定ファイルの中身を返す。public_key_file に公開鍵の中身（複数行）を直接貼った場合は、
-    それを yahoo_public_key.pem に書き出し、設定上はそのファイル名として扱う（設定ファイル自体は書き換えない）。"""
-    text = CONFIG_FILE.read_text(encoding="utf-8-sig")
+    それを同じフォルダの yahoo_public_key.pem に書き出し、設定上はそのファイル名として扱う（設定ファイル自体は書き換えない）。"""
+    text = config_file.read_text(encoding="utf-8-sig")
     m = PEM_BLOCK.search(text)
     if m:
+        key_file = config_file.parent / PUBLIC_KEY_NAME
         body = re.sub(r"-----(BEGIN|END) PUBLIC KEY-----|\s", "", m.group(0))
         pem = ("-----BEGIN PUBLIC KEY-----\n" + "\n".join(body[i:i + 64] for i in range(0, len(body), 64))
                + "\n-----END PUBLIC KEY-----\n")
-        if not PUBLIC_KEY_FILE.exists() or PUBLIC_KEY_FILE.read_text(encoding="ascii") != pem:
-            PUBLIC_KEY_FILE.write_text(pem, encoding="ascii", newline="\n")
-        text = text[:m.start()] + PUBLIC_KEY_FILE.name + text[m.end():]
+        if not key_file.exists() or key_file.read_text(encoding="ascii") != pem:
+            key_file.write_text(pem, encoding="ascii", newline="\n")
+        text = text[:m.start()] + PUBLIC_KEY_NAME + text[m.end():]
     return text
 
 
-def load_config(env=None):
-    if not CONFIG_FILE.exists():
-        raise SystemExit(f"設定ファイルがありません: {CONFIG_FILE}（yahoo_shopping_config.ini.sample をコピーして作成してください）")
+def load_config(env=None, config_file=None):
+    """設定を読む。config_file を指定すると（出荷データ作成アプリなど、別のフォルダから使うとき）その設定ファイルを読み、
+    トークン・公開鍵もそのフォルダのものを使う。"""
+    config_file = Path(config_file) if config_file else CONFIG_FILE
+    if not config_file.exists():
+        raise SystemExit(f"設定ファイルがありません: {config_file}（yahoo_shopping_config.ini.sample をコピーして作成してください）")
     c = configparser.ConfigParser()
-    c.read_string(_config_text())
+    c.read_string(_config_text(config_file))
     section = "YAHOO_SHOPPING_TEST" if env == "test" and c.has_section("YAHOO_SHOPPING_TEST") else "YAHOO_SHOPPING"
     s = c[section]
     cfg = {k: s.get(k, "").strip() for k in ("client_id", "client_secret", "redirect_uri", "seller_id", "environment",
@@ -65,7 +71,8 @@ def load_config(env=None):
     if cfg["environment"] not in HOSTS:
         raise SystemExit("yahoo_shopping_config.ini の environment は production か test にしてください")
     cfg["host"] = HOSTS[cfg["environment"]]
-    cfg["token_file"] = BASE_DIR / f"yahoo_shopping_token_{cfg['environment']}.json"
+    cfg["base_dir"] = config_file.parent
+    cfg["token_file"] = cfg["base_dir"] / f"yahoo_shopping_token_{cfg['environment']}.json"
     return cfg
 
 
@@ -155,7 +162,7 @@ def signature_headers(cfg):
         return {}
     path = Path(cfg["public_key_file"])
     if not path.is_absolute():
-        path = BASE_DIR / path
+        path = cfg["base_dir"] / path
     n, e = load_public_key(path)
     plain = f"{cfg['seller_id']}:{int(time.time())}".encode("ascii")
     return {"X-sws-signature": base64.b64encode(rsa_pkcs1_encrypt(plain, n, e)).decode("ascii"),
@@ -221,8 +228,8 @@ def order_list(cfg, start, end):
 
 
 def order_items(cfg, order_id):
-    """注文詳細API。(注文ステータス, [(商品コード, サブコード, 数量)]) を返す。"""
-    xml = (f"<Req><Target><OrderId>{order_id}</OrderId><Field>OrderId,OrderStatus,LineId,ItemId,SubCode,Quantity</Field>"
+    """注文詳細API。(注文ステータス, [(商品コード, サブコード, 数量, 商品名)]) を返す。"""
+    xml = (f"<Req><Target><OrderId>{order_id}</OrderId><Field>OrderId,OrderStatus,LineId,ItemId,SubCode,Quantity,Title</Field>"
            f"</Target><SellerId>{cfg['seller_id']}</SellerId></Req>")
     r = call(cfg, "orderInfo", xml=xml)
     if r.status_code != 200:
@@ -231,8 +238,58 @@ def order_items(cfg, order_id):
     if info is None:
         raise RuntimeError(f"orderInfo: {order_id} の注文情報がありません")
     return info.findtext("OrderStatus") or "", [
-        ((it.findtext("ItemId") or "").strip(), (it.findtext("SubCode") or "").strip(), (it.findtext("Quantity") or "").strip())
+        ((it.findtext("ItemId") or "").strip(), (it.findtext("SubCode") or "").strip(), (it.findtext("Quantity") or "").strip(),
+         (it.findtext("Title") or "").strip())
         for it in info.iter("Item")]
+
+
+def _fields(el):
+    """XML の要素の子を {項目名: 値} にする。商品（Item）は "Item" に [{項目名: 値}] で入れる。"""
+    row = {"Item": []}
+    for ch in el:
+        if ch.tag == "Item":
+            row["Item"].append({c.tag: (c.text or "").strip() for c in ch})
+        else:
+            row[ch.tag] = (ch.text or "").strip()
+    return row
+
+
+def shipped_orders(cfg, first, last, fields, lookback_days=120):
+    """出荷日が first〜last（date）の注文を [{項目名: 値, "Item": [商品]}] で返す（注文検索API）。
+    注文日時の指定が必須のため、first の lookback_days 日前から last までに注文されたものを探す。
+    商品は1行目しか返らない（2行目以降は order_lines で取る）。"""
+    now = datetime.now(JST)
+    start = datetime(first.year, first.month, first.day, tzinfo=JST) - timedelta(days=lookback_days)
+    end = min(datetime(last.year, last.month, last.day, 23, 59, 59, tzinfo=JST), now)
+    out, pos = [], 1
+    while True:
+        xml = (f"<Req><Search><Result>2000</Result><Start>{pos}</Start><Sort>+order_time</Sort>"
+               f"<Condition><OrderTimeFrom>{start:%Y%m%d%H%M%S}</OrderTimeFrom><OrderTimeTo>{end:%Y%m%d%H%M%S}</OrderTimeTo>"
+               f"<ShipDateFrom>{first:%Y%m%d}</ShipDateFrom><ShipDateTo>{last:%Y%m%d}</ShipDateTo></Condition>"
+               f"<Field>{fields}</Field></Search><SellerId>{cfg['seller_id']}</SellerId></Req>")
+        r = call(cfg, "orderList", xml=xml)
+        if r.status_code != 200:
+            raise ApiError("orderList", r)
+        root = ET.fromstring(r.content)
+        infos = list(root.iter("OrderInfo"))
+        out += [_fields(o) for o in infos]
+        pos += len(infos)
+        if not infos or pos > int(root.findtext(".//TotalCount") or 0):
+            return out
+        time.sleep(1)  # 1クエリー/秒
+
+
+def order_lines(cfg, order_id):
+    """注文詳細APIで、注文のすべての商品を [{LineId, ItemId, SubCode, Title, Quantity, UnitPrice}] で返す。"""
+    xml = (f"<Req><Target><OrderId>{order_id}</OrderId><Field>OrderId,LineId,ItemId,SubCode,Title,Quantity,UnitPrice</Field>"
+           f"</Target><SellerId>{cfg['seller_id']}</SellerId></Req>")
+    r = call(cfg, "orderInfo", xml=xml)
+    if r.status_code != 200:
+        raise ApiError("orderInfo", r)
+    info = ET.fromstring(r.content).find(".//OrderInfo")
+    if info is None:
+        raise RuntimeError(f"orderInfo: {order_id} の注文情報がありません")
+    return _fields(info)["Item"]
 
 
 def get_stock(cfg, item_codes):

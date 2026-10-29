@@ -34,6 +34,8 @@ import requests
 
 APP_NAME = "出荷データ作成"
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+if not getattr(sys, "frozen", False):
+    sys.path.append(str(APP_DIR.parent))  # yahoo_shopping_api（exe には build_exe.bat で入れる）
 CONFIG_FILE = APP_DIR / "shipping_export.ini"
 HISTORY_FILE = APP_DIR / "出力履歴.json"
 JST = timezone(timedelta(hours=9))
@@ -99,6 +101,11 @@ token =
 base_url = https://world-switch.com/kaitoriouji/ext
 ; 既存の設定ファイル（[WASABI] がある wasabi_config.ini）を使う場合はそのパス。token が空のときだけ使う
 config_file =
+
+[YAHOO_SHOPPING]
+; 売上集計でヤフーの注文API を使うための設定ファイル（yahoo_shopping_config.ini）のパス。空なら exe の1つ上のフォルダのもの。
+; トークン（yahoo_auth.bat でログインして作るもの）と公開鍵は、その設定ファイルと同じフォルダのものを使う
+config_file =
 """
 
 
@@ -143,7 +150,10 @@ def load_config():
         if o.has_section("WASABI"):
             ws["token"] = o["WASABI"].get("token", "").strip()
             ws["base_url"] = (o["WASABI"].get("base_url", "") or ws["base_url"]).strip().rstrip("/")
+    y = c["YAHOO_SHOPPING"] if c.has_section("YAHOO_SHOPPING") else {}
+    yahoo = Path(y.get("config_file", "").strip() or APP_DIR.parent / "yahoo_shopping_config.ini")
     return {
+        "yahoo_config": yahoo if yahoo.exists() else None,
         "amazon": amz if all(amz[k] for k in ("client_id", "client_secret", "refresh_token")) else None,
         "wasabi": ws if ws["token"] and "ここに" not in ws["token"] else None,
         "default_days": int(s.get("default_days", "14") or 14),
@@ -1267,39 +1277,103 @@ def amazon_ship_sales(cfg, first, last, log):
     return {d: [round(s[0]), s[1], len(orders[d])] for d, s in amounts.items()}
 
 
+YAHOO_SALES_FIELDS = ("OrderId,OrderStatus,ShipDate,IsYahooAuctionOrder,TotalPrice,ShipCharge,PayCharge,GiftWrapCharge,"
+                      "Discount,TotalMallCouponDiscount,GiftCardDiscount,LineId,ItemId,SubCode,Title,Quantity,UnitPrice")
+
+
+def yahoo_shipped_orders(cfg, first, last, log):
+    """出荷日が first〜last のヤフーの注文を [(発送日, モール, 注文)] で返す（注文API）。モールは "yahoo"（ヤフオク店）か
+    "yahoo_shopping"（ヤフーショッピング）。キャンセルされた注文は除く。注文検索APIは1行目の商品しか返さないため、
+    合計金額が1行目の商品と送料などで説明できない注文（まとめて取引など）だけ、注文詳細APIで全部の商品を取る（1件1秒）。"""
+    try:
+        import yahoo_shopping_api as yapi
+        ycfg = yapi.load_config(config_file=cfg["yahoo_config"])
+        orders = yapi.shipped_orders(ycfg, first, last, YAHOO_SALES_FIELDS)
+    except SystemExit as e:  # 設定・トークンが無い、ログインの期限切れなど
+        raise RuntimeError(f"ヤフー: {e}")
+    out, cancelled, more = [], 0, []
+    for o in orders:
+        if o.get("OrderStatus") == "4":
+            cancelled += 1
+            continue
+        expect = (sum(num(i.get("UnitPrice")) * num(i.get("Quantity")) for i in o["Item"])
+                  + num(o.get("ShipCharge")) + num(o.get("PayCharge")) + num(o.get("GiftWrapCharge"))
+                  - abs(num(o.get("Discount"))) - abs(num(o.get("TotalMallCouponDiscount"))) - abs(num(o.get("GiftCardDiscount"))))
+        if num(o.get("TotalPrice")) != expect:
+            more.append(o)
+        out.append(o)
+    log(f"売上集計: ヤフー 発送日が期間内の注文 {len(out):,}件" + (f" / キャンセルで除外 {cancelled}件" if cancelled else "")
+        + (f"。商品が複数の注文 {len(more):,}件の明細を取得します（1件1秒）" if more else ""))
+    for n, o in enumerate(more, 1):
+        time.sleep(1)  # 1クエリー/秒
+        try:
+            o["Item"] = yapi.order_lines(ycfg, o["OrderId"])
+        except SystemExit as e:
+            raise RuntimeError(f"ヤフー: {e}")
+        if n % 50 == 0:
+            log(f"売上集計: ヤフー 明細を取得中 {n:,}/{len(more):,}")
+    return [(datetime.strptime(o["ShipDate"], "%Y-%m-%d").date(),
+             "yahoo" if o.get("IsYahooAuctionOrder") == "true" else "yahoo_shopping", o) for o in out]
+
+
+def yahoo_ship_sales(cfg, first, last, log):
+    """ヤフーの発送日ごとの売上 {"yahoo_shopping": {日付: [売上金額, 売上点数, 売上件数]}, "yahoo": {…}}。
+    売上金額は注文の合計金額（TotalPrice。商品代金＋送料・手数料−値引き。ポイント利用分は引かない）。"""
+    out = {"yahoo_shopping": {}, "yahoo": {}}
+    for day, mall, o in yahoo_shipped_orders(cfg, first, last, log):
+        s = out[mall].setdefault(day, [0, 0, 0])
+        s[0] += num(o.get("TotalPrice"))
+        s[1] += sum(num(i.get("Quantity")) for i in o["Item"])
+        s[2] += 1
+    return out
+
+
+def sales_label(cfg, m):
+    """売上集計の列名に使うモール名。ヤフーはショッピングとヤフオク店を分ける。"""
+    return cfg["mall"][m] if m in ("yahoo", "yahoo_shopping") else MALL_JA[m]
+
+
 def create_ship_sales(cfg, first, last, log):
-    """発送日ごとの売上金額・売上点数・売上件数を、楽天・Amazon の API から集計して CSV に出す。
-    戻り値は CSV のパス。どちらのキーも無ければ None。楽天と Amazon は同時に取得する
-    （Amazon は呼び出し回数の制限で1日分に30秒ほど、1か月分で15分ほどかかる）。"""
+    """発送日ごとの売上金額・売上点数・売上件数を、楽天・Amazon・ヤフー（ショッピングとヤフオク店）の API から集計して
+    CSV に出す。戻り値は CSV のパス。どのキーも無ければ None。各モールは同時に取得する
+    （Amazon は呼び出し回数の制限で1日分に30秒ほど、1か月分で15分ほどかかる）。
+    ヤフーは注文API に許可した IP アドレスからしか使えないため、取得できなくても他のモールの集計は出す。"""
     jobs = {}
     if cfg["rakuten_secret"] and cfg["rakuten_key"]:
-        jobs["rakuten"] = rakuten_ship_sales
+        jobs["rakuten"] = lambda *a: {"rakuten": rakuten_ship_sales(*a)}
     else:
         log("売上集計: 楽天の API キーが無いため、楽天は集計しません")
     if cfg["amazon"]:
-        jobs["amazon"] = amazon_ship_sales
+        jobs["amazon"] = lambda *a: {"amazon": amazon_ship_sales(*a)}
         log(f"売上集計: Amazon は1日分に30秒ほどかかります（{(last - first).days + 1}日分）")
     else:
         log("売上集計: Amazon の API キーが無いため、Amazon は集計しません")
+    if cfg["yahoo_config"]:
+        jobs["yahoo"] = yahoo_ship_sales
+    else:
+        log("売上集計: ヤフーの設定ファイル（yahoo_shopping_config.ini）が無いため、ヤフーは集計しません")
     if not jobs:
         return None
-    data, errors = {}, []
+    got, errors = {}, {}
 
     def fetch(m):
         try:
-            data[m] = jobs[m](cfg, first, last, log)
+            got[m] = jobs[m](cfg, first, last, log)
         except Exception as e:
-            errors.append(e)
+            errors[m] = e
 
     threads = [threading.Thread(target=fetch, args=(m,), daemon=True) for m in jobs]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    if "yahoo" in errors and len(errors) == 1 and got:
+        log(f"売上集計: ヤフーは取得できなかったため集計していません（{errors.pop('yahoo')}）")
     if errors:
-        raise errors[0]
-    data = {m: data[m] for m in jobs}  # 列の並びを楽天・Amazon の順にする
-    header = ["発送日"] + [f"{MALL_JA[m]} {k}" for m in data for k in SHIP_SALES_ITEMS] + [f"合計 {k}" for k in SHIP_SALES_ITEMS]
+        raise next(iter(errors.values()))
+    data = {m: v for j in jobs if j in got for m, v in got[j].items()}  # 列の並びを楽天・Amazon・ヤフーの順にする
+    header = (["発送日"] + [f"{sales_label(cfg, m)} {k}" for m in data for k in SHIP_SALES_ITEMS]
+              + [f"合計 {k}" for k in SHIP_SALES_ITEMS])
     rows, totals, day = [], {m: [0, 0, 0] for m in data}, first
     while day <= last:
         row, all_ = [day.strftime("%Y-%m-%d")], [0, 0, 0]
@@ -1319,9 +1393,81 @@ def create_ship_sales(cfg, first, last, log):
         w.writerow(header)
         w.writerows(rows)
     for m in data:
-        log(f"売上集計: {MALL_JA[m]} 売上金額 {totals[m][0]:,}円 / 売上点数 {totals[m][1]:,}点 / 売上件数 {totals[m][2]:,}件")
+        log(f"売上集計: {sales_label(cfg, m)} 売上金額 {totals[m][0]:,}円 / 売上点数 {totals[m][1]:,}点 / 売上件数 {totals[m][2]:,}件")
     log(f"売上集計を作成しました: {path.name}")
     return path
+
+
+YAHOO_ITEM_HEADER = ["発送日", "モール", "注文番号", "明細番号", "商品番号", "商品コード", "商品名", "単価", "数量", "小計",
+                     "商品番号の取得元"]
+YAHOO_ITEM_SUMMARY = ["商品番号", "商品名", "売上点数", "売上金額", "売上件数", "最初の発送日", "最後の発送日"]
+
+
+def create_yahoo_item_sales(cfg, first, last, log):
+    """ヤフー（ショッピング・ヤフオク店）の商品番号ごとの売上（発送日が first〜last）。明細（1行＝1商品）と
+    商品番号ごとの合計の CSV を出す。売上金額は商品の単価（税込）×数量。送料・値引きは注文単位のため含めない。
+    商品番号は、ショッピングは商品コード、ヤフオク店は商品名の中の商品番号、無ければワサビの商品名から探す。
+    戻り値は (明細のファイル, 合計のファイル)。ヤフーの設定が無ければ (None, None)。"""
+    if not cfg["yahoo_config"]:
+        log("売上集計: ヤフーの設定ファイル（yahoo_shopping_config.ini）が無いため集計できません")
+        return None, None
+    lines, postage = [], 0
+    for day, mall, o in yahoo_shipped_orders(cfg, first, last, log):
+        postage += num(o.get("ShipCharge"))
+        for i in o["Item"]:
+            code, title = i.get("ItemId", ""), i.get("Title", "")
+            sku, src = "", ""
+            if code and not code.upper().startswith("AUCTION"):
+                sku, src = code.upper(), "商品コード"
+            elif SKU_IN_TEXT.findall(title):
+                sku, src = SKU_IN_TEXT.findall(title)[-1].upper(), "商品名"
+            price, qty = num(i.get("UnitPrice")), num(i.get("Quantity"))
+            lines.append({"発送日": day.strftime("%Y-%m-%d"), "モール": cfg["mall"][mall], "注文番号": o.get("OrderId", ""),
+                          "明細番号": i.get("LineId", ""), "商品番号": sku, "商品コード": code, "商品名": title,
+                          "単価": price, "数量": qty, "小計": price * qty, "商品番号の取得元": src})
+    missing = [r for r in lines if not r["商品番号"]]
+    if missing and cfg["wasabi"]:
+        found, error = ws_find_skus(cfg["wasabi"], [r["商品名"] for r in missing], log, "売上集計")
+        if error:  # 通信エラーなど。集計は止めない
+            log(f"売上集計: ワサビで商品番号を探す途中でエラーになりました（{type(error).__name__}: {str(error)[:80]}）")
+        for r in missing:
+            sku = found.get(r["商品名"].strip(), ("", []))[0]
+            if sku:
+                r["商品番号"], r["商品番号の取得元"] = sku.upper(), "ワサビの商品名"
+    lines.sort(key=lambda r: (r["発送日"], r["注文番号"], num(r["明細番号"])))
+    by = {}
+    for r in lines:
+        key = r["商品番号"] or NO_SKU
+        s = by.setdefault(key, {"商品番号": key, "商品名": r["商品名"], "売上点数": 0, "売上金額": 0,
+                                "売上件数": set(), "最初の発送日": r["発送日"], "最後の発送日": r["発送日"]})
+        s["売上点数"] += r["数量"]
+        s["売上金額"] += r["小計"]
+        s["売上件数"].add(r["注文番号"])
+        s["最後の発送日"] = max(s["最後の発送日"], r["発送日"])
+    stamp = f"{first:%Y%m%d}-{last:%Y%m%d}_{datetime.now(JST):%Y%m%d%H%M%S}"
+    cfg["output_dir"].mkdir(parents=True, exist_ok=True)
+    detail = cfg["output_dir"] / f"売上明細_ヤフー_{stamp}.csv"
+    with open(detail, "w", newline="", encoding="utf-8-sig") as f:  # Excel でそのまま開けるように BOM 付き
+        w = csv.DictWriter(f, fieldnames=YAHOO_ITEM_HEADER)
+        w.writeheader()
+        w.writerows(lines)
+    summary = cfg["output_dir"] / f"売上集計_ヤフー_商品番号別_{stamp}.csv"
+    rows = [{**s, "売上件数": len(s["売上件数"])}
+            for s in sorted(by.values(), key=lambda s: (s["商品番号"] == NO_SKU, s["商品番号"]))]
+    with open(summary, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=YAHOO_ITEM_SUMMARY)
+        w.writeheader()
+        w.writerows(rows)
+        w.writerow({"商品番号": "合計", "売上点数": sum(r["売上点数"] for r in rows),
+                    "売上金額": sum(r["売上金額"] for r in rows), "売上件数": len({r["注文番号"] for r in lines})})
+    left = [r for r in lines if not r["商品番号"]]
+    log(f"売上集計: ヤフー 商品番号 {len(rows):,}種類 / 売上点数 {sum(r['売上点数'] for r in rows):,}点 / "
+        f"売上金額 {sum(r['売上金額'] for r in rows):,}円（送料 {postage:,}円・値引きは含めていません）")
+    if left:
+        log(f"売上集計: 商品番号が分からない明細 {len(left)}行（「{NO_SKU}」にまとめました）: "
+            + ", ".join(f"{r['注文番号']}-{r['明細番号']}「{r['商品名'][:15]}」" for r in left[:10]))
+    log(f"売上集計を作成しました: {detail.name} / {summary.name}")
+    return detail, summary
 
 
 def main_gui():
@@ -1357,10 +1503,12 @@ def main_gui():
     tk.Entry(sf, textvariable=ship_from_var, width=12).pack(side="left", padx=(6, 2))
     tk.Label(sf, text="〜").pack(side="left")
     tk.Entry(sf, textvariable=ship_to_var, width=12).pack(side="left", padx=2)
-    ship_btn = tk.Button(sf, text="日別（楽天・Amazon）", padx=8)
+    ship_btn = tk.Button(sf, text="日別（楽天・Amazon・ヤフー）", padx=8)
     ship_btn.pack(side="left", padx=(10, 0))
     item_btn = tk.Button(sf, text="商品番号別（楽天）", padx=8)
     item_btn.pack(side="left", padx=6)
+    yahoo_item_btn = tk.Button(sf, text="商品番号別（ヤフー）", padx=8)
+    yahoo_item_btn.pack(side="left")
 
     tk.Label(root, text="ファイル（出荷済みリスト end-order.csv、Amazon の注文レポート、メルカリ・ヤフオクの注文CSV）", padx=10).pack(anchor="w")
     tk.Label(root, text="ヤフオク1（個人）: 取引ナビのページで Ctrl+A → Ctrl+C してから「取引ナビを貼り付け」（1件ずつ）",
@@ -1521,12 +1669,16 @@ def main_gui():
 
     ship_btn.configure(command=lambda: run_ship_sales(ship_btn, create_ship_sales))
     item_btn.configure(command=lambda: run_ship_sales(item_btn, create_rakuten_item_sales))
+    yahoo_item_btn.configure(command=lambda: run_ship_sales(yahoo_item_btn, create_yahoo_item_sales))
     log(f"設定ファイル: {CONFIG_FILE}")
     log(f"出力先: {cfg['output_dir']}")
     if not (cfg["rakuten_secret"] and cfg["rakuten_key"]):
         log("楽天の API キーが未設定です（shipping_export.ini）。楽天は取得しません")
     if not cfg["wasabi"]:
         log("ワサビのトークンが未設定です（shipping_export.ini の [WASABI]）。ヤフオクのまとめて取引の2つ目以降の商品コードは探しません")
+    if not cfg["yahoo_config"]:
+        log("ヤフーの設定ファイル（yahoo_shopping_config.ini）が見つかりません（shipping_export.ini の [YAHOO_SHOPPING]）。"
+            "売上集計にヤフーは入りません")
     root.mainloop()
 
 
@@ -1534,8 +1686,10 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         # 起動確認用（画面を出さない）: 設定を読み、結果を selftest.txt に書く
         import tkinter  # noqa: F401  exe に画面部品が入っているかの確認
+        import yahoo_shopping_api  # noqa: F401  exe にヤフーの部品が入っているかの確認
         c = load_config()
         (APP_DIR / "selftest.txt").write_text(
-            f"ok\nconfig={CONFIG_FILE}\nrakuten_key={'set' if c['rakuten_key'] else 'empty'}\noutput={c['output_dir']}\n", encoding="utf-8")
+            f"ok\nconfig={CONFIG_FILE}\nrakuten_key={'set' if c['rakuten_key'] else 'empty'}\noutput={c['output_dir']}\n"
+            f"yahoo_config={c['yahoo_config']}\n", encoding="utf-8")
         sys.exit(0)
     main_gui()

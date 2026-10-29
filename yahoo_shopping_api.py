@@ -288,9 +288,10 @@ def shipped_orders(cfg, first, last, fields, lookback_days=120):
 
 
 def order_lines(cfg, order_id):
-    """注文詳細APIで、注文のすべての商品を [{LineId, ItemId, SubCode, Title, Quantity, UnitPrice}] で返す。"""
-    xml = (f"<Req><Target><OrderId>{order_id}</OrderId><Field>OrderId,LineId,ItemId,SubCode,Title,Quantity,UnitPrice</Field>"
-           f"</Target><SellerId>{cfg['seller_id']}</SellerId></Req>")
+    """注文詳細APIで、注文のすべての商品を [{LineId, ItemId, SubCode, Title, Quantity, UnitPrice, ItemYahooAucMerchantId}]
+    で返す。ItemYahooAucMerchantId はストアオークション（ヤフオク店）の出品時の商品コード。"""
+    xml = (f"<Req><Target><OrderId>{order_id}</OrderId><Field>OrderId,LineId,ItemId,SubCode,Title,Quantity,UnitPrice,"
+           f"ItemYahooAucMerchantId</Field></Target><SellerId>{cfg['seller_id']}</SellerId></Req>")
     r = call(cfg, "orderInfo", xml=xml)
     if r.status_code != 200:
         raise ApiError("orderInfo", r)

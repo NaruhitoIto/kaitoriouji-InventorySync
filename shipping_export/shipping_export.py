@@ -540,7 +540,7 @@ YAHOO_DETAIL_FIELDS = (
     "ShipFirstName,ShipLastName,ShipFirstNameKana,ShipLastNameKana,ShipZipCode,ShipPrefecture,ShipCity,ShipAddress1,"
     "ShipAddress2,ShipPhoneNumber,BillFirstName,BillLastName,BillFirstNameKana,BillLastNameKana,BillMailAddress,BillZipCode,"
     "BillPrefecture,BillCity,BillAddress1,BillAddress2,BillPhoneNumber,TotalPrice,ShipCharge,PayCharge,TotalMallCouponDiscount,"
-    "UsePoint,LineId,ItemId,SubCode,Title,Quantity,UnitPrice,YahooAuctionMerchantId")
+    "UsePoint,LineId,ItemId,SubCode,Title,Quantity,UnitPrice,YahooAuctionMerchantId,ItemYahooAucMerchantId")
 
 
 def yahoo_api(cfg):
@@ -595,12 +595,13 @@ def yahoo_api_order(cfg, d):
                       "備考": d.get("BuyerComments", "").strip(), "送料": num(d.get("ShipCharge")),
                       "代引き手数料": num(d.get("PayCharge")), "値引き": abs(num(d.get("TotalMallCouponDiscount"))),
                       "使用ポイント": num(d.get("UsePoint")), "合計": num(d.get("TotalPrice")), "請求合計": num(d.get("TotalPrice"))})
-    # ヤフオク店は ItemId が AUCTION… なので、出品時の商品コード（YahooAuctionMerchantId）を使う。
-    # これは商品ごとではなく注文に1つ（注文CSVの D列と同じ）なので、まとめて取引の2つ目以降は下で探す
+    # ヤフオク店は ItemId が AUCTION… なので、出品時の商品コードを使う。商品ごとの ItemYahooAucMerchantId を優先し、
+    # 無ければ注文に1つの YahooAuctionMerchantId（注文CSVの D列と同じで1つ目の商品の分だけ）
     merchant = line_values(d.get("YahooAuctionMerchantId")) if auction else []
     for i, it in enumerate(d["Item"]):
         title = it.get("Title", "")
-        code = (merchant[i] if i < len(merchant) else "") if auction else it.get("ItemId", "")
+        code = ((it.get("ItemYahooAucMerchantId") or (merchant[i] if i < len(merchant) else "")) if auction
+                else it.get("ItemId", ""))
         if not code:
             found = SKU_IN_TEXT.findall(title)  # 無ければタイトルの商品番号（それも無ければ fill_missing_skus でワサビから探す）
             code = found[-1] if found else ""
@@ -1409,7 +1410,8 @@ def amazon_ship_sales(cfg, first, last, log):
 
 
 YAHOO_SALES_FIELDS = ("OrderId,OrderStatus,ShipDate,IsYahooAuctionOrder,TotalPrice,ShipCharge,PayCharge,GiftWrapCharge,"
-                      "Discount,TotalMallCouponDiscount,GiftCardDiscount,LineId,ItemId,SubCode,Title,Quantity,UnitPrice")
+                      "Discount,TotalMallCouponDiscount,GiftCardDiscount,LineId,ItemId,SubCode,Title,Quantity,UnitPrice,"
+                      "ItemYahooAucMerchantId")
 
 
 def yahoo_shipped_orders(cfg, first, last, log):
@@ -1537,7 +1539,8 @@ YAHOO_ITEM_SUMMARY = ["商品番号", "商品名", "売上点数", "売上金額
 def create_yahoo_item_sales(cfg, first, last, log):
     """ヤフー（ショッピング・ヤフオク店）の商品番号ごとの売上（発送日が first〜last）。明細（1行＝1商品）と
     商品番号ごとの合計の CSV を出す。売上金額は商品の単価（税込）×数量。送料・値引きは注文単位のため含めない。
-    商品番号は、ショッピングは商品コード、ヤフオク店は商品名の中の商品番号、無ければワサビの商品名から探す。
+    商品番号は、ショッピングは商品コード、ヤフオク店は出品時の商品コード（ItemYahooAucMerchantId）、無ければ
+    商品名の中の商品番号、それも無ければワサビの商品名から探す。
     戻り値は (明細のファイル, 合計のファイル)。ヤフーの設定が無ければ (None, None)。"""
     if not cfg["yahoo_config"]:
         log("売上集計: ヤフーの設定ファイル（yahoo_shopping_config.ini）が無いため集計できません")
@@ -1547,9 +1550,12 @@ def create_yahoo_item_sales(cfg, first, last, log):
         postage += num(o.get("ShipCharge"))
         for i in o["Item"]:
             code, title = i.get("ItemId", ""), i.get("Title", "")
+            merchant = SKU_IN_TEXT.findall(i.get("ItemYahooAucMerchantId", ""))
             sku, src = "", ""
             if code and not code.upper().startswith("AUCTION"):
                 sku, src = code.upper(), "商品コード"
+            elif merchant:
+                sku, src = merchant[0].upper(), "ヤフオクの商品コード"
             elif SKU_IN_TEXT.findall(title):
                 sku, src = SKU_IN_TEXT.findall(title)[-1].upper(), "商品名"
             price, qty = num(i.get("UnitPrice")), num(i.get("Quantity"))

@@ -39,4 +39,5 @@
   - 金額はモールクーポン・ポイント値引き前（`TotalPrice + TotalMallCouponDiscount + UsePoint`、ストアクリエイターProの注文CSVの Sale Total に当たる。楽天の totalPrice と同じ考え方）。
   - ログ・数量のキャッシュ：`%LOCALAPPDATA%\InventorySync-dashboard\`（`yahoo_sync.log`、`yahoo_qty_cache.json`）。
   - Claude のデスクトップアプリから `%LOCALAPPDATA%`（AppData）に作ったファイル・フォルダは、アプリ専用の場所に振り替えられてタスクスケジューラからは見えない。タスクが使うファイルを Claude が用意するときは AppData の外（`C:\` 直下など）に置く。
+- 売上進捗メール：claude.ai のルーティン「売上進捗メール10時」（毎日10時）が、ダッシュボードのデータベース（`sales_daily`・`manual_overrides`）を読み、`dashboard/sales_mail.py` で件名・本文（受注日ベースの昨日／当月累計／先読み）を作って Gmail で送る。モールのまとめ方（どの店舗をどの行に入れるか）は `sales_mail.py` の `MALLS`。日付が抜けている・合計が合わないときは送らない。
 - 2026-10-29 に wasabi-dashboard-sync リポジトリ（アーカイブ済み）から履歴ごと移した。

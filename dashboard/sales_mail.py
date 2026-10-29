@@ -23,6 +23,7 @@ from pathlib import Path
 
 JST = timezone(timedelta(hours=9))
 SUBJECT = "{m}/{d}買取王子:昨日/累計/先読み"
+DASHBOARD_URL = "https://claude.ai/artifact/Rh2Bphn3ALJXbGKeuq1MvF"
 # (メールの表示名, WASABI の shop_id)。ダッシュボードの店舗名: 1 楽天市場店・32 楽天SKU、5 Amazon店、
 # 6 ヤフオク店・28 併売ヤフオク・29 ヤフオク1・30 ヤフオク2、8 ヤフーショッピング店、22 ラクマ、
 # 25〜27 自社店舗、31 メルカリ。
@@ -97,10 +98,11 @@ def build(folder, send_date):
         return y, c, forecast(c, n_days, elapsed)
 
     total = line(sum(last.values()), sum(cum.values()))
-    body = [f"■売上金額:昨日{total[0]:,}円 / 累計{total[1]:,}円 / 先読み{total[2]:,}円", "", "■売上金額"]
+    body = [f"■売上金額:{total[0]:,}円 / {total[1]:,}円 / {total[2]:,}円", "", "■売上金額"]
     for name, _ in rows:
         y, c, f = line(last[name], cum[name])
         body += [f"--{name}--", f"{y:,}円  / {c:,}円  / {f:,}円", ""]
+    body += ["■ダッシュボード", DASHBOARD_URL]
     subject = SUBJECT.format(m=send_date.month, d=send_date.day)
     return subject, "\n".join(body).rstrip() + "\n"
 

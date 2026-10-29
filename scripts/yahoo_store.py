@@ -1,5 +1,8 @@
 """Yahoo!ショッピング ストアAPI(orderList / orderInfo)から、1日分の受注・発送を集計する。
 
+- ストアAPIには、ヤフーショッピング店の注文とヤフオク店(ストアのオークション)の注文が両方入る。
+  IsYahooAuctionOrder で分け、"shopping" と "auction" の2つの集計を返す(ほとんどはヤフオク店)。
+
 - 認証: 環境変数 YAHOO_CLIENT_ID / YAHOO_CLIENT_SECRET / YAHOO_REFRESH_TOKEN / YAHOO_SELLER_ID
   (申請した固定IPのPCの環境変数)。実行のたびにリフレッシュトークンからアクセストークンを取得する。
 - 公開鍵認証: YAHOO_PUBLIC_KEY_PATH(ストアクリエイターPro > 設定 > 暗号鍵管理 の公開鍵を保存したファイル)と
@@ -127,7 +130,7 @@ def _post(path, xml_body):
 
 
 def _order_list(condition_xml):
-    """条件に合う注文の [{id, total(値引き前), status, updated}] を全ページ取得する。"""
+    """条件に合う注文の [{id, total(値引き前), status, updated, auction}] を全ページ取得する。"""
     seller = escape(os.environ["YAHOO_SELLER_ID"])
     num = lambda o, k: int(float(o.findtext(k) or 0))
     orders, start = [], 1
@@ -135,7 +138,7 @@ def _order_list(condition_xml):
         root = _post("orderList", (
             f"<Req><Search><Result>{PAGE}</Result><Start>{start}</Start>"
             f"<Condition>{condition_xml}</Condition>"
-            f"<Field>OrderId,TotalPrice,TotalMallCouponDiscount,UsePoint,OrderStatus,LastUpdateTime</Field></Search>"
+            f"<Field>OrderId,TotalPrice,TotalMallCouponDiscount,UsePoint,OrderStatus,LastUpdateTime,IsYahooAuctionOrder</Field></Search>"
             f"<SellerId>{seller}</SellerId></Req>"))
         batch = root.findall(".//OrderInfo")
         for o in batch:
@@ -144,6 +147,7 @@ def _order_list(condition_xml):
                 "total": num(o, "TotalPrice") + num(o, "TotalMallCouponDiscount") + num(o, "UsePoint"),
                 "status": (o.findtext("OrderStatus") or "").strip(),
                 "updated": o.findtext("LastUpdateTime") or "",
+                "auction": (o.findtext("IsYahooAuctionOrder") or "").strip() == "true",
             })
         total = int(root.findtext(".//TotalCount") or len(batch))
         start += PAGE
@@ -169,19 +173,25 @@ def _cached_quantity(o, qty_cache, d):
 
 
 def fetch_day(d, qty_cache=None):
-    """d: 'YYYY-MM-DD' (JST)。受注・発送の集計を返す(rakuten_rms.fetch_day と同じ形)。"""
+    """d: 'YYYY-MM-DD' (JST)。{"shopping": 集計, "auction": 集計} を返す。
+    集計はどちらも rakuten_rms.fetch_day と同じ形({ordered, qty, count, shipped, shipped_count})。"""
     ymd = d.replace("-", "")
     since = (date.fromisoformat(d) - timedelta(days=SHIP_LOOKBACK_DAYS)).strftime("%Y%m%d")
     ordered = _order_list(f"<OrderTimeFrom>{ymd}000000</OrderTimeFrom><OrderTimeTo>{ymd}235959</OrderTimeTo>")
     shipped = _order_list(f"<OrderTimeFrom>{since}000000</OrderTimeFrom><OrderTimeTo>{ymd}235959</OrderTimeTo>"
                           f"<ShipDateFrom>{ymd}</ShipDateFrom><ShipDateTo>{ymd}</ShipDateTo>")
-    return {
-        "ordered": sum(o["total"] for o in ordered),
-        "qty": sum(_cached_quantity(o, qty_cache, d) for o in ordered),
-        "count": len(ordered),
-        "shipped": sum(o["total"] for o in shipped),
-        "shipped_count": len(shipped),
-    }
+    out = {}
+    for kind, auction in (("shopping", False), ("auction", True)):
+        o_ = [o for o in ordered if o["auction"] == auction]
+        s_ = [o for o in shipped if o["auction"] == auction]
+        out[kind] = {
+            "ordered": sum(o["total"] for o in o_),
+            "qty": sum(_cached_quantity(o, qty_cache, d) for o in o_),
+            "count": len(o_),
+            "shipped": sum(o["total"] for o in s_),
+            "shipped_count": len(s_),
+        }
+    return out
 
 
 if __name__ == "__main__":

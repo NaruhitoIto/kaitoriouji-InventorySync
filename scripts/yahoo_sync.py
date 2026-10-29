@@ -1,5 +1,5 @@
-"""このPC(注文APIに申請した固定IP)で定期実行し、Yahoo!ショッピング(店舗8)の集計値だけを
-data/yahoo_sales.json に書いてプッシュする。Actions の fetch_sales.py はこのファイルを読んで店舗8に反映する。
+"""このPC(注文APIに申請した固定IP)で定期実行し、ストアAPIの注文(ヤフーショッピング店・ヤフオク店)の集計値だけを
+data/yahoo_sales.json に書いてプッシュする。Actions の fetch_sales.py はこのファイルを読んで店舗8・6に反映する。
 
 - タスクスケジューラ用の専用クローン(作業用のクローンとは別)で動かす。実行のたびに git pull --rebase する。
 - 認証情報はユーザー環境変数(yahoo_auth.py で設定)。ファイルには集計値と再認可の期限の目安だけを書く。
@@ -26,6 +26,7 @@ CACHE = os.path.join(LOCAL_DIR, "yahoo_qty_cache.json")
 LOCK = os.path.join(LOCAL_DIR, "yahoo_sync.lock")
 LOCK_STALE_SEC = 3 * 3600  # これより古いロックは異常終了の残りとみなす
 JST = timezone(timedelta(hours=9))
+FORMAT = 2              # days[日付] = {"shopping": 集計, "auction": 集計}。1 はショッピングとヤフオク店の合算だった
 KEEP_DAYS = 60          # yahoo_sales.json と数量キャッシュに残す日数
 AUTH_DAYS = 28          # 公開鍵認証ありの再認可間隔
 WARN_DAYS = 5           # 再認可の期限がこの日数以内なら警告
@@ -118,6 +119,8 @@ def run(args):
         print(f"WARNING yahoo: 再認可の期限 {expires} が近いです。python scripts/yahoo_auth.py を実行してください")
 
     doc = load_json(OUT, {"days": {}})
+    if doc.get("format") != FORMAT:
+        doc = {"days": {}}  # 古い形の日は使わない(取り直す)
     cache = load_json(CACHE, {})
     today = datetime.now(JST).date()
     started = time.time()
@@ -138,7 +141,7 @@ def run(args):
     cutoff = (today - timedelta(days=KEEP_DAYS)).isoformat()
     days = {d: v for d, v in sorted(doc["days"].items()) if d >= cutoff}
     generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    save_json(OUT, {"generated_at": generated_at, "auth_expires": expires, "days": days})
+    save_json(OUT, {"format": FORMAT, "generated_at": generated_at, "auth_expires": expires, "days": days})
     save_json(CACHE, {k: v for k, v in cache.items() if v["date"] >= cutoff})
     print(f"wrote {len(days)} day(s) in {time.time() - started:.0f}s")
 

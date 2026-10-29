@@ -32,6 +32,7 @@ jobs:
           RAKUTEN_SERVICE_SECRET: ${{ secrets.RAKUTEN_SERVICE_SECRET }}
           RAKUTEN_LICENSE_KEY: ${{ secrets.RAKUTEN_LICENSE_KEY }}
           YAHOO_FROM: ${{ vars.YAHOO_FROM }}
+          YAHOO_AUCTION_FROM: ${{ vars.YAHOO_AUCTION_FROM }}
 
       - run: |
           git config user.name "github-actions[bot]"

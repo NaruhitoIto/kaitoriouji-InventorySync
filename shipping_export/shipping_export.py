@@ -18,7 +18,6 @@
 ・一度出力した注文は「出力履歴.json」に記録し、次回からは出力しない（二重出荷を防ぐ）
 ・設定（楽天APIのキー、モール名など）は exe と同じフォルダの shipping_export.ini
 """
-import base64
 import configparser
 import csv
 import io
@@ -37,7 +36,11 @@ import requests
 APP_NAME = "出荷データ作成"
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 if not getattr(sys, "frozen", False):
-    sys.path.append(str(APP_DIR.parent))  # yahoo_shopping_api（exe には build_exe.bat で入れる）
+    # 1つ上のフォルダの共通部品（rakuten_rms_api・wasabi_api・yahoo_shopping_api。exe には build_exe.bat で入れる）
+    sys.path.append(str(APP_DIR.parent))
+
+import rakuten_rms_api as rms  # noqa: E402
+import wasabi_api  # noqa: E402
 CONFIG_FILE = APP_DIR / "shipping_export.ini"
 HISTORY_FILE = APP_DIR / "出力履歴.json"
 JST = timezone(timedelta(hours=9))
@@ -287,42 +290,21 @@ def rakuten_term(v):
     return v
 
 
-def rakuten_headers(cfg):
-    token = base64.b64encode(f"{cfg['rakuten_secret']}:{cfg['rakuten_key']}".encode()).decode()
-    return {"Authorization": f"ESA {token}", "Content-Type": "application/json; charset=UTF-8"}
+def rakuten_keys(cfg):
+    return cfg["rakuten_secret"], cfg["rakuten_key"]
 
 
 def fetch_rakuten(cfg, since, log):
     if not cfg["rakuten_secret"] or not cfg["rakuten_key"]:
         log("楽天: shipping_export.ini に API のキーが無いため取得しません")
         return []
-    h = rakuten_headers(cfg)
     now = datetime.now(JST)
     start = max(since, now - timedelta(days=cfg["rakuten_days"]))
-    numbers, page = [], 1
-    while True:
-        body = {"version": 7, "dateType": 1, "orderProgressList": [300],
-                "startDatetime": start.strftime("%Y-%m-%dT%H:%M:%S%z"), "endDatetime": now.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "PaginationRequestModel": {"requestRecordsAmount": 1000, "requestPage": page}}
-        r = requests.post("https://api.rms.rakuten.co.jp/es/2.0/order/searchOrder/", headers=h, json=body, timeout=60)
-        if r.status_code != 200:
-            raise RuntimeError(f"楽天 searchOrder エラー HTTP {r.status_code}: {r.text[:300]}")
-        data = r.json()
-        if any(m.get("messageType") == "ERROR" for m in data.get("MessageModelList") or []):
-            raise RuntimeError(f"楽天 searchOrder エラー: {data['MessageModelList']}")
-        numbers += data.get("orderNumberList") or []
-        if page >= int((data.get("PaginationResponseModel") or {}).get("totalPages", 1) or 1):
-            break
-        page += 1
+    numbers = rms.search(rakuten_keys(cfg), start, now, progress=[300])
     log(f"楽天: 発送待ちの注文 {len(numbers)}件（{start:%m/%d %H:%M} 以降の注文）")
     orders = []
-    for i in range(0, len(numbers), 100):
-        r = requests.post("https://api.rms.rakuten.co.jp/es/2.0/order/getOrder/", headers=h,
-                          json={"orderNumberList": numbers[i:i + 100], "version": 7}, timeout=60)
-        if r.status_code != 200:
-            raise RuntimeError(f"楽天 getOrder エラー HTTP {r.status_code}: {r.text[:300]}")
-        for m in r.json().get("OrderModelList", []):
-            orders.extend(rakuten_order(cfg, m))
+    for m in rms.get_orders(rakuten_keys(cfg), numbers):
+        orders.extend(rakuten_order(cfg, m))
     return orders
 
 
@@ -659,18 +641,10 @@ WS_BATCH = 50  # 1回の検索で調べる商品名の数（1件ずつ探すと�
 
 
 def ws_post(ws, query, page=1, limit=10):
-    """ワサビの商品検索を1回呼ぶ。サーバー側のエラー（500番台）はしばらく待って2回までやり直す。"""
-    for attempt in range(3):
-        r = requests.post(f"{ws['base_url']}/api/products/search", timeout=120, json={
-            "sort": "product_id", "reverse": False, "page": page, "limit": limit, "query": query},
-            headers={"Authorization": f"Bearer {ws['token']}", "Content-Type": "application/json", "Accept": "application/json"})
-        time.sleep(0.4)  # 速度制限（約3リクエスト/秒）を守る
-        if r.status_code == 200:
-            return r.json()
-        if r.status_code < 500 and r.status_code != 429:
-            break
-        time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"ワサビの商品検索 HTTP {r.status_code}")
+    """ワサビの商品検索を1回呼ぶ。サーバー側のエラー（500番台）・通信エラーはしばらく待って2回までやり直す。"""
+    data = wasabi_api.search_products(ws, query, page, limit, retries=3, timeout=120)
+    time.sleep(0.4)  # 速度制限（約3リクエスト/秒）を守る
+    return data
 
 
 def ws_search(ws, query):
@@ -1252,42 +1226,25 @@ RAKUTEN_CANCELLED = {"800", "900"}  # キャンセル確定待ち・キャンセ
 def rakuten_shipped_orders(cfg, first, last, log):
     """発送日が first〜last の楽天の注文を [(発送日, 注文)] で返す。RMS の発送日で1日ずつ検索し、getOrder で中身を取る。
     キャンセルされた注文は除く。"""
-    h = rakuten_headers(cfg)
+    keys = rakuten_keys(cfg)
     ship_day, day = {}, first  # 注文番号 → 発送日（期間内で最初に見つかった日）
     while day <= last:
         start = datetime(day.year, day.month, day.day, tzinfo=JST)
-        page = 1
-        while True:
-            body = {"version": 7, "dateType": 4,  # 4 = 発送日
-                    "startDatetime": start.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "endDatetime": (start + timedelta(days=1, seconds=-1)).strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "PaginationRequestModel": {"requestRecordsAmount": 1000, "requestPage": page}}
-            r = requests.post("https://api.rms.rakuten.co.jp/es/2.0/order/searchOrder/", headers=h, json=body, timeout=60)
-            if r.status_code != 200:
-                raise RuntimeError(f"楽天 searchOrder エラー HTTP {r.status_code}: {r.text[:300]}")
-            data = r.json()
-            if any(m.get("messageType") == "ERROR" for m in data.get("MessageModelList") or []):
-                raise RuntimeError(f"楽天 searchOrder エラー: {data['MessageModelList']}")
-            for n in data.get("orderNumberList") or []:
-                ship_day.setdefault(n, day)
-            if page >= int((data.get("PaginationResponseModel") or {}).get("totalPages", 1) or 1):
-                break
-            page += 1
+        for n in rms.search(keys, start, start + timedelta(days=1, seconds=-1), date_type=rms.DATE_SHIP):
+            ship_day.setdefault(n, day)
         day += timedelta(days=1)
     log(f"売上集計: 楽天 発送日が期間内の注文 {len(ship_day):,}件。明細を取得します")
-    out, cancelled, numbers = [], 0, list(ship_day)
-    for i in range(0, len(numbers), 100):
-        r = requests.post("https://api.rms.rakuten.co.jp/es/2.0/order/getOrder/", headers=h,
-                          json={"orderNumberList": numbers[i:i + 100], "version": 7}, timeout=60)
-        if r.status_code != 200:
-            raise RuntimeError(f"楽天 getOrder エラー HTTP {r.status_code}: {r.text[:300]}")
-        for m in r.json().get("OrderModelList", []):
-            if str(m.get("orderProgress")) in RAKUTEN_CANCELLED:
-                cancelled += 1
-            else:
-                out.append((ship_day[m["orderNumber"]], m))
-        if (i // 100 + 1) % 20 == 0:
-            log(f"売上集計: 楽天 明細を取得中 {min(i + 100, len(numbers)):,}/{len(numbers):,}")
+
+    def progress(done, total):
+        if done % 2000 == 0:
+            log(f"売上集計: 楽天 明細を取得中 {done:,}/{total:,}")
+
+    out, cancelled = [], 0
+    for m in rms.get_orders(keys, list(ship_day), progress=progress):
+        if str(m.get("orderProgress")) in RAKUTEN_CANCELLED:
+            cancelled += 1
+        else:
+            out.append((ship_day[m["orderNumber"]], m))
     if cancelled:
         log(f"売上集計: 楽天 キャンセルされた注文 {cancelled}件は除きました")
     return out

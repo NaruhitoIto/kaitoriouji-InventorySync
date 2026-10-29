@@ -21,7 +21,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-import requests
+import wasabi_api
 
 BASE_DIR = Path(__file__).resolve().parent
 WASABI_CONFIG = BASE_DIR / "wasabi_config.ini"
@@ -78,34 +78,8 @@ IN_STOCK_QUERY = {"在庫数": {"eq": "1"}}  # 在庫1の商品だけを取得�
 
 
 def fetch_page(cfg, page, query=None, sort="product_id"):
-    """/api/products/search を1ページ取得する。429/5xx は少し待ってリトライ。"""
-    url = f"{cfg['base_url'].rstrip('/')}/api/products/search"
-    headers = {
-        "Authorization": f"Bearer {cfg['token']}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    body = {
-        "sort": sort,
-        "reverse": False,
-        "page": page,
-        "limit": cfg["page_limit"],
-        "query": query or {},
-    }
-    for attempt in range(4):
-        try:
-            r = requests.post(url, headers=headers, json=body, timeout=60)
-        except requests.RequestException as e:
-            log.warning(f"通信エラー（ページ {page}, 試行 {attempt + 1}）: {type(e).__name__}")
-            time.sleep(3 * (attempt + 1))
-            continue
-        if r.status_code in (429, 500, 502, 503):
-            time.sleep(2 * (attempt + 1))
-            continue
-        if r.status_code != 200:
-            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
-        return r.json()
-    raise RuntimeError("リトライ上限に達しました")
+    """/api/products/search を1ページ取得する。通信エラー・429/5xx は wasabi_api が少し待ってリトライ。"""
+    return wasabi_api.search_products(cfg, query, page, cfg["page_limit"], sort)
 
 
 def iter_products(cfg, max_pages=None, query=None):
@@ -376,21 +350,10 @@ def probe_queries(cfg):
         ("出品状況 に 楽天市場店", {"出品状況": {"includes": "楽天市場店"}}),
         ("商品番号 が 'sk' を含む", {"商品番号": {"includes": "sk"}}),
     ]
-    url = f"{cfg['base_url'].rstrip('/')}/api/products/search"
-    headers = {
-        "Authorization": f"Bearer {cfg['token']}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
     for label, query in candidates:
-        body = {"sort": "product_id", "reverse": False, "page": 1, "limit": 1, "query": query}
         try:
-            r = requests.post(url, headers=headers, json=body, timeout=60)
-            if r.status_code == 200:
-                data = r.json()
-                log.info(f"[{label}] total={data.get('total')} / 先頭: {str(data.get('data', [{}])[0].get('商品番号') if data.get('data') else '')}")
-            else:
-                log.info(f"[{label}] HTTP {r.status_code}: {r.text[:200]}")
+            data = wasabi_api.search_products(cfg, query, limit=1, retries=1)
+            log.info(f"[{label}] total={data.get('total')} / 先頭: {str(data.get('data', [{}])[0].get('商品番号') if data.get('data') else '')}")
         except Exception as e:
             log.info(f"[{label}] 失敗: {e}")
         time.sleep(0.4)

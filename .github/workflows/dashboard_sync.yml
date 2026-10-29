@@ -1,4 +1,4 @@
-name: Sync WASABI sales data
+name: Sync WASABI sales data (dashboard)
 
 on:
   schedule:
@@ -25,7 +25,7 @@ jobs:
 
       - run: pip install requests
 
-      - run: python scripts/fetch_sales.py
+      - run: python dashboard/fetch_sales.py
         env:
           WASABI_AUTH: ${{ secrets.WASABI_AUTH }}
           WINDOW_DAYS: ${{ github.event.inputs.window_days }}
@@ -37,7 +37,7 @@ jobs:
       - run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/latest_sales.json
+          git add dashboard/data/latest_sales.json
           git diff --staged --quiet || git commit -m "Update sales data"
           git pull --rebase
           git push

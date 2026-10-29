@@ -85,7 +85,17 @@ def save_token(cfg, tok, authorized_at=None):
     tok["obtained_at"] = int(time.time())
     if authorized_at:
         tok["authorized_at"] = int(authorized_at)
-    cfg["token_file"].write_text(json.dumps(tok, ensure_ascii=False, indent=1), encoding="utf-8")
+    # 在庫連携・出荷データ作成・売上集計が同じトークンを使うため、書きかけの中身を読まれないよう別名で書いて置き換える
+    path = cfg["token_file"]
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.tmp.json")
+    tmp.write_text(json.dumps(tok, ensure_ascii=False, indent=1), encoding="utf-8")
+    for _ in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:  # Windows で、ほかのプログラムがちょうど読んでいる
+            time.sleep(0.2)
+    os.replace(tmp, path)
 
 
 def reauth_deadline(cfg):

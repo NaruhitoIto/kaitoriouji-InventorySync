@@ -7,10 +7,10 @@
   python rakuten_orders_sync.py --dry-run   # ファイルは作るが、FTPへは送らない（まず必ずこれで確認）
   python rakuten_orders_sync.py             # 送信する（FTP）
 """
-import sys, json, base64, configparser, ftplib, io, logging, time
+import sys, json, configparser, ftplib, io, logging, time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-import requests
+import rakuten_rms_api as rms
 
 BASE_DIR = Path(__file__).resolve().parent
 RAKUTEN_CFG = BASE_DIR / "rakuten_api_config.ini"
@@ -20,7 +20,6 @@ OUT_DIR = BASE_DIR / "stock_csv"
 LOG_DIR = BASE_DIR / "logs"
 JST = timezone(timedelta(hours=9))
 
-RMS_SEARCH_URL = "https://api.rms.rakuten.co.jp/es/2.0/order/searchOrder/"
 # 注文の進捗コードのうち、キャンセル扱いにする値（在庫を戻すので減算しない）
 CANCEL_PROGRESS = {"700", "800", "900"}
 API_VERSION = 6  # RMS注文API のバージョン（エラーが出る場合はここを変更）
@@ -53,48 +52,13 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-def rms_headers(rk):
-    token = base64.b64encode(f"{rk['service_secret'].strip()}:{rk['license_key'].strip()}".encode()).decode()
-    return {"Authorization": f"ESA {token}", "Content-Type": "application/json; charset=UTF-8"}
-
-
 def search_orders(rk, start, end):
-    """期間内の注文を全ページ取得して返す（注文番号・進捗・商品リストを含む）。"""
-    orders, page = [], 1
-    while True:
-        body = {
-            "version": API_VERSION,
-            "dateType": 1,  # 1 = 注文日（RMS仕様で要確認）
-            "startDatetime": start.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "endDatetime": end.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "PaginationRequestModel": {"requestRecordsAmount": 100, "requestPage": page},
-        }
-        r = requests.post(RMS_SEARCH_URL, headers=rms_headers(rk), json=body, timeout=60)
-        if r.status_code != 200:
-            raise SystemExit(f"RMS API エラー HTTP {r.status_code}: {r.text[:500]}")
-        data = r.json()
-        if page == 1:
-            log.info(f"APIレスポンスのキー: {list(data.keys())}")
-        if data.get("MessageModelList") and any(m.get("messageType") == "ERROR" for m in data["MessageModelList"]):
-            raise SystemExit(f"RMS API エラー: {data['MessageModelList']}")
-        # 注文番号リストを取得し、詳細（商品）を getOrder で読む
-        numbers = data.get("orderNumberList") or []
-        if numbers:
-            orders.extend(get_order_details(rk, numbers))
-        pag = (data.get("PaginationResponseModel") or {})
-        total_pages = int(pag.get("totalPages", 1) or 1)
-        if page >= total_pages or not numbers:
-            break
-        page += 1
-    return orders
-
-
-def get_order_details(rk, numbers):
-    url = "https://api.rms.rakuten.co.jp/es/2.0/order/getOrder/"
-    r = requests.post(url, headers=rms_headers(rk), json={"orderNumberList": numbers, "version": API_VERSION}, timeout=60)
-    if r.status_code != 200:
-        raise SystemExit(f"RMS getOrder エラー HTTP {r.status_code}: {r.text[:500]}")
-    return r.json().get("OrderModelList", [])
+    """期間内（注文日）の注文を全ページ取得し、getOrder で商品まで読んで返す。"""
+    keys = (rk["service_secret"].strip(), rk["license_key"].strip())
+    try:
+        return rms.get_orders(keys, rms.search(keys, start, end), version=API_VERSION)
+    except RuntimeError as e:
+        raise SystemExit(f"RMS API エラー: {e}")
 
 
 def collect_skus(orders, processed):

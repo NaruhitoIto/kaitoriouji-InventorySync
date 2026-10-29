@@ -1,14 +1,22 @@
+"""WASABI の売上集計(受注・発送)に、楽天・ヤフーのAPIの値を反映して data/latest_sales.json に書く。
+GitHub Actions(.github/workflows/dashboard_sync.yml)が毎時実行する。
+
+API の呼び出しはリポジトリ直下の共通部品(wasabi_api・rakuten_rms_api)を使う。
+"""
 import os
+import sys
 import time
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-import requests
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # リポジトリ直下の共通部品
 
-import rakuten_rms
-import yahoo_file
+import rakuten_sales  # noqa: E402
+import wasabi_api  # noqa: E402
+import yahoo_file  # noqa: E402
 
-BASE = "https://world-switch.com/kaitoriouji/ext"
+OUT = Path(__file__).resolve().parent / "data" / "latest_sales.json"
 # この日付以降は該当店舗をモールAPIの値で差し替える。
 # それより前の日付はWASABIの値を残し、APIの値はログに比較表示するだけ。
 RAKUTEN_FROM = os.environ.get("RAKUTEN_FROM") or "2026-10-17"
@@ -19,36 +27,15 @@ YAHOO_AUCTION_FROM = os.environ.get("YAHOO_AUCTION_FROM") or "2026-10-17"
 # (ログ名, モジュール, WASABIのshop_id, 置き換え開始日)
 # ヤフーの注文APIは固定IPのPCからしか呼べないため、そのPCが書いた data/yahoo_sales.json を読む。
 API_SOURCES = [
-    ("rakuten", rakuten_rms, 1, RAKUTEN_FROM),
+    ("rakuten", rakuten_sales, 1, RAKUTEN_FROM),
     ("yahoo", yahoo_file.source("shopping"), 8, YAHOO_FROM),
     ("yahoo_auction", yahoo_file.source("auction"), 6, YAHOO_AUCTION_FROM),
 ]
-AUTH = os.environ["WASABI_AUTH"]
-HEADERS = {"Authorization": f"Bearer {AUTH}"}
+WASABI = wasabi_api.load_config()  # Actions では secret の WASABI_AUTH
 SHOP_IDS = [1, 4, 5, 6, 8, 11, 20, 22, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34]
 WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS") or 4)
 JST = timezone(timedelta(hours=9))
 RETRIES = 5
-
-
-def request_with_retry(method, url, **kwargs):
-    """Retry on timeouts, connection errors, 429 and 5xx with exponential backoff."""
-    for attempt in range(1, RETRIES + 1):
-        try:
-            r = requests.request(method, url, headers=HEADERS, **kwargs)
-            if r.status_code == 429 or r.status_code >= 500:
-                raise requests.HTTPError(f"{r.status_code} for {url}", response=r)
-            r.raise_for_status()
-            return r
-        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            if status is not None and status < 500 and status != 429:
-                raise  # 4xx other than 429: retrying will not help
-            if attempt == RETRIES:
-                raise
-            wait = 2 ** attempt
-            print(f"retry {attempt}/{RETRIES - 1} after {wait}s: {e}")
-            time.sleep(wait)
 
 
 def daterange():
@@ -57,13 +44,9 @@ def daterange():
 
 
 def fetch_totals(endpoint, start, end):
-    r = request_with_retry(
-        "GET",
-        f"{BASE}/api/total/{endpoint}",
-        params={"start_date": start, "end_date": end},
-        timeout=30,
-    )
-    return {row["date"]: row for row in r.json()}
+    rows = wasabi_api.request(WASABI, "GET", f"/api/total/{endpoint}", retries=RETRIES, timeout=30,
+                              params={"start_date": start, "end_date": end})
+    return {row["date"]: row for row in rows}
 
 
 def fetch_qty(d):
@@ -72,9 +55,11 @@ def fetch_qty(d):
     total_qty = 0
     page = 1
     while True:
-        r = request_with_retry(
+        payload = wasabi_api.request(
+            WASABI,
             "POST",
-            f"{BASE}/api/orders/search",
+            "/api/orders/search",
+            retries=RETRIES,
             json={
                 "limit": 1000,
                 "page": page,
@@ -82,7 +67,6 @@ def fetch_qty(d):
             },
             timeout=60,
         )
-        payload = r.json()
         for o in payload["data"]:
             shop = int(o["shop_id"])
             count_by_shop[shop] = count_by_shop.get(shop, 0) + 1
@@ -116,6 +100,8 @@ def apply_api_day(name, doc, shop_id, from_date, d, r):
 
 
 def main():
+    if not WASABI:
+        sys.exit("WASABI のトークンがありません(Actions の secret WASABI_AUTH、PC なら wasabi_config.ini)")
     dates = daterange()
     ordered = fetch_totals("ordered", dates[0], dates[-1])
     shipped = fetch_totals("shipped", dates[0], dates[-1])
@@ -166,10 +152,10 @@ def main():
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "docs": docs,
     }
-    os.makedirs("data", exist_ok=True)
-    with open("data/latest_sales.json", "w", encoding="utf-8") as f:
+    OUT.parent.mkdir(exist_ok=True)
+    with open(OUT, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
-    print(f"Wrote {len(docs)} day(s) to data/latest_sales.json")
+    print(f"Wrote {len(docs)} day(s) to {OUT.name}")
 
 
 if __name__ == "__main__":

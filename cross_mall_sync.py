@@ -43,7 +43,6 @@ WS の状態ファイル（wasabi_stock_state.json）は読むだけで変更し
 
 ヤフオク: 在庫連携をやめたため、止める一覧は作らない（inbox/yahoo/ に注文ファイルを置けば、楽天・Amazon の在庫0はする）。
 """
-import base64
 import configparser
 import csv
 import ftplib
@@ -58,8 +57,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-import requests
-
+import rakuten_rms_api as rms
 import wasabi_stock_sync as ws
 from amazon_sp_api import BASE_DIR, load_amazon_config, sp_request
 
@@ -195,42 +193,17 @@ def add_sold(state, sku, src, order_id, at):
 
 # ---------- 楽天（注文取得） ----------
 
-def rakuten_headers():
-    c = configparser.ConfigParser()
-    c.read(RAKUTEN_CFG, encoding="utf-8")
-    rk = c["RAKUTEN_API"]
-    token = base64.b64encode(f"{rk['service_secret'].strip()}:{rk['license_key'].strip()}".encode()).decode()
-    return {"Authorization": f"ESA {token}", "Content-Type": "application/json; charset=UTF-8"}
-
-
 def rakuten_orders(start, end):
     """注文日時が期間内の注文を取得し、[(注文番号, 進捗, [SKU...])] を返す。"""
-    h = rakuten_headers()
-    result, page = [], 1
-    while True:
-        body = {"version": 6, "dateType": 1,
-                "startDatetime": start.strftime("%Y-%m-%dT%H:%M:%S%z"), "endDatetime": end.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "PaginationRequestModel": {"requestRecordsAmount": 100, "requestPage": page}}
-        r = requests.post("https://api.rms.rakuten.co.jp/es/2.0/order/searchOrder/", headers=h, json=body, timeout=60)
-        if r.status_code != 200:
-            raise RuntimeError(f"RMS searchOrder HTTP {r.status_code}: {r.text[:300]}")
-        data = r.json()
-        if any(m.get("messageType") == "ERROR" for m in data.get("MessageModelList") or []):
-            raise RuntimeError(f"RMS searchOrder エラー: {data['MessageModelList']}")
-        numbers = data.get("orderNumberList") or []
-        if numbers:
-            d = requests.post("https://api.rms.rakuten.co.jp/es/2.0/order/getOrder/", headers=h,
-                              json={"orderNumberList": numbers, "version": 6}, timeout=60)
-            if d.status_code != 200:
-                raise RuntimeError(f"RMS getOrder HTTP {d.status_code}: {d.text[:300]}")
-            for o in d.json().get("OrderModelList", []):
-                skus = [it.get("itemNumber") or it.get("manageNumber")
-                        for pkg in o.get("PackageModelList", []) for it in pkg.get("ItemModelList", [])]
-                result.append((o.get("orderNumber"), str(o.get("orderProgress", "")), [s for s in skus if s]))
-        total_pages = int((data.get("PaginationResponseModel") or {}).get("totalPages", 1) or 1)
-        if page >= total_pages or not numbers:
-            return result
-        page += 1
+    keys = rms.load_keys(RAKUTEN_CFG)
+    if not keys:
+        raise RuntimeError("rakuten_api_config.ini の [RAKUTEN_API] service_secret / license_key がありません")
+    result = []
+    for o in rms.get_orders(keys, rms.search(keys, start, end), version=6):
+        skus = [it.get("itemNumber") or it.get("manageNumber")
+                for pkg in o.get("PackageModelList", []) for it in pkg.get("ItemModelList", [])]
+        result.append((o.get("orderNumber"), str(o.get("orderProgress", "")), [s for s in skus if s]))
+    return result
 
 
 def collect_rakuten(state, now, dry):

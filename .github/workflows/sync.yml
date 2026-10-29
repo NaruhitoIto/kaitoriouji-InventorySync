@@ -31,6 +31,11 @@ jobs:
           WINDOW_DAYS: ${{ github.event.inputs.window_days }}
           RAKUTEN_SERVICE_SECRET: ${{ secrets.RAKUTEN_SERVICE_SECRET }}
           RAKUTEN_LICENSE_KEY: ${{ secrets.RAKUTEN_LICENSE_KEY }}
+          YAHOO_CLIENT_ID: ${{ secrets.YAHOO_CLIENT_ID }}
+          YAHOO_CLIENT_SECRET: ${{ secrets.YAHOO_CLIENT_SECRET }}
+          YAHOO_REFRESH_TOKEN: ${{ secrets.YAHOO_REFRESH_TOKEN }}
+          YAHOO_SELLER_ID: ${{ secrets.YAHOO_SELLER_ID }}
+          YAHOO_FROM: ${{ vars.YAHOO_FROM }}
 
       - run: |
           git config user.name "github-actions[bot]"

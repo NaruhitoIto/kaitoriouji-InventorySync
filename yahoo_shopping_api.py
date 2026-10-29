@@ -254,19 +254,14 @@ def _fields(el):
     return row
 
 
-def shipped_orders(cfg, first, last, fields, lookback_days=120):
-    """出荷日が first〜last（date）の注文を [{項目名: 値, "Item": [商品]}] で返す（注文検索API）。
-    注文日時の指定が必須のため、first の lookback_days 日前から last までに注文されたものを探す。
-    商品は1行目しか返らない（2行目以降は order_lines で取る）。"""
-    now = datetime.now(JST)
-    start = datetime(first.year, first.month, first.day, tzinfo=JST) - timedelta(days=lookback_days)
-    end = min(datetime(last.year, last.month, last.day, 23, 59, 59, tzinfo=JST), now)
+def search_orders(cfg, start, end, condition, fields):
+    """注文検索API。注文日時が start〜end（datetime）で、condition（<OrderStatus>2</OrderStatus> などの XML）に合う注文を
+    [{項目名: 値, "Item": [商品]}] で返す（古い順）。商品は1行目しか返らない（全部は order_detail で取る）。"""
     out, pos = [], 1
     while True:
         xml = (f"<Req><Search><Result>2000</Result><Start>{pos}</Start><Sort>+order_time</Sort>"
                f"<Condition><OrderTimeFrom>{start:%Y%m%d%H%M%S}</OrderTimeFrom><OrderTimeTo>{end:%Y%m%d%H%M%S}</OrderTimeTo>"
-               f"<ShipDateFrom>{first:%Y%m%d}</ShipDateFrom><ShipDateTo>{last:%Y%m%d}</ShipDateTo></Condition>"
-               f"<Field>{fields}</Field></Search><SellerId>{cfg['seller_id']}</SellerId></Req>")
+               f"{condition}</Condition><Field>{fields}</Field></Search><SellerId>{cfg['seller_id']}</SellerId></Req>")
         r = call(cfg, "orderList", xml=xml)
         if r.status_code != 200:
             raise ApiError("orderList", r)
@@ -277,6 +272,17 @@ def shipped_orders(cfg, first, last, fields, lookback_days=120):
         if not infos or pos > int(root.findtext(".//TotalCount") or 0):
             return out
         time.sleep(1)  # 1クエリー/秒
+
+
+def shipped_orders(cfg, first, last, fields, lookback_days=120):
+    """出荷日が first〜last（date）の注文を [{項目名: 値, "Item": [商品]}] で返す（注文検索API）。
+    注文日時の指定が必須のため、first の lookback_days 日前から last までに注文されたものを探す。
+    商品は1行目しか返らない（2行目以降は order_lines で取る）。"""
+    now = datetime.now(JST)
+    start = datetime(first.year, first.month, first.day, tzinfo=JST) - timedelta(days=lookback_days)
+    end = min(datetime(last.year, last.month, last.day, 23, 59, 59, tzinfo=JST), now)
+    return search_orders(cfg, start, end, f"<ShipDateFrom>{first:%Y%m%d}</ShipDateFrom><ShipDateTo>{last:%Y%m%d}</ShipDateTo>",
+                         fields)
 
 
 def order_lines(cfg, order_id):
@@ -290,6 +296,45 @@ def order_lines(cfg, order_id):
     if info is None:
         raise RuntimeError(f"orderInfo: {order_id} の注文情報がありません")
     return _fields(info)["Item"]
+
+
+def order_detail(cfg, order_id, fields):
+    """注文詳細API。{項目名: 値, "Item": [{項目名: 値}]} を返す。Ship・Pay・Detail の中の項目も同じ階層に入れる。"""
+    xml = (f"<Req><Target><OrderId>{order_id}</OrderId><Field>{fields}</Field></Target>"
+           f"<SellerId>{cfg['seller_id']}</SellerId></Req>")
+    r = call(cfg, "orderInfo", xml=xml)
+    if r.status_code != 200:
+        raise ApiError("orderInfo", r)
+    info = ET.fromstring(r.content).find(".//OrderInfo")
+    if info is None:
+        raise RuntimeError(f"orderInfo: {order_id} の注文情報がありません")
+    row = {"Item": []}
+    for ch in info:
+        if ch.tag == "Item":
+            row["Item"].append({c.tag: (c.text or "").strip() for c in ch})
+        elif len(ch):
+            row.update({c.tag: (c.text or "").strip() for c in ch})
+        else:
+            row[ch.tag] = (ch.text or "").strip()
+    return row
+
+
+def set_ship_status(cfg, order_id, status):
+    """出荷ステータス変更API。status: 1=出荷可 2=出荷処理中 3=出荷済み。ポイント確定要否は仕様どおり true にする。"""
+    xml = (f"<Req><Target><OrderId>{order_id}</OrderId><IsPointFix>true</IsPointFix></Target>"
+           f"<Order><Ship><ShipStatus>{status}</ShipStatus></Ship></Order><SellerId>{cfg['seller_id']}</SellerId></Req>")
+    r = call(cfg, "orderShipStatusChange", xml=xml)
+    if r.status_code != 200:
+        raise ApiError("orderShipStatusChange", r)
+
+
+def mark_seen(cfg, order_id):
+    """注文内容変更APIで閲覧済みにする（ストアクリエイターProの「新規注文」から「入金待ち」「出荷待ち」へ移る）。"""
+    xml = (f"<Req><Target><OrderId>{order_id}</OrderId></Target><Order><IsSeen>true</IsSeen></Order>"
+           f"<SellerId>{cfg['seller_id']}</SellerId></Req>")
+    r = call(cfg, "orderChange", xml=xml)
+    if r.status_code != 200:
+        raise ApiError("orderChange", r)
 
 
 def get_stock(cfg, item_codes):

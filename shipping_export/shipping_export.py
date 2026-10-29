@@ -8,7 +8,9 @@
   楽天     : RMS 受注API で「発送待ち（進捗300）」の注文を取得
   Amazon   : セラーセントラルの注文レポート（未出荷の注文）ファイル
   メルカリ : メルカリShopsの注文CSV（orders_*.csv）
-  ヤフオク : ヤフオクの注文CSV（YahooAuctionId, OrderId, ... の形式）。入金済み（PayStatus=1）だけ出力
+  ヤフー   : 注文API で「処理中・入金済・出荷可」の注文を取得（ヤフオク店・ヤフーショッピング店）。出力した注文は
+             ヤフー側で「出荷処理中」にし、未入金の新規注文は閲覧済みにして「入金待ち」へ移す
+  ヤフオク : ヤフオクの注文CSV（YahooAuctionId, OrderId, ... の形式）。入金済み（PayStatus=1）だけ出力（API を使わないとき）
   ヤフオク1: 個人アカウントの取引ナビのページの文字（Ctrl+A → Ctrl+C →「取引ナビを貼り付け」）。発送連絡の前の取引だけ
 
 ・注文ファイルは「注文ファイルを追加」で選ぶ（どのモールのファイルかは列名から自動で判定）
@@ -79,6 +81,8 @@ yahoo_shopping_mall = ヤフーショッピング店
 auction_mall = ヤフオク1
 ; 楽天の発送待ち注文を何日前までさかのぼって探すか（最大62）
 rakuten_days = 30
+; ヤフーの入金済み・出荷可の注文を何日前までさかのぼって探すか（銀行振込は入金が遅れることがあるので長め）
+yahoo_days = 60
 ; 画面の「注文日がこの日時以降」の初期値（何日前か）。出荷済みリストで除外するので広めでよい
 default_days = 14
 ; ヤフオク店の注文番号の頭に付ける文字（ワサビの注文番号は「ストアID-注文番号」）
@@ -165,6 +169,7 @@ def load_config():
                  "mercari": s.get("mercari_mall", "メルカリ"), "yahoo": s.get("yahoo_mall", "ヤフオク店"), "yahoo_shopping": s.get("yahoo_shopping_mall", "ヤフーショッピング店"),
                  "auction": s.get("auction_mall", "ヤフオク1")},
         "rakuten_days": min(int(s.get("rakuten_days", "30") or 30), 62),
+        "yahoo_days": int(s.get("yahoo_days", "60") or 60),
     }
 
 
@@ -526,6 +531,124 @@ def read_yahoo(cfg, rows, log, since):
     return list(orders.values())
 
 
+# ---------------------------------------------------------------- ヤフー（注文API）
+
+YAHOO_READY = "<OrderStatus>2</OrderStatus><PayStatus>1</PayStatus><ShipStatus>1</ShipStatus>"  # 処理中・入金済・出荷可
+YAHOO_UNPAID_NEW = "<OrderStatus>2</OrderStatus><PayStatus>0</PayStatus><IsSeen>false</IsSeen>"  # 未入金の新規注文
+YAHOO_DETAIL_FIELDS = (
+    "OrderId,OrderTime,IsYahooAuctionOrder,IsSeen,BuyerComments,PayMethodName,PayDate,ShipRequestDate,ShipRequestTime,"
+    "ShipFirstName,ShipLastName,ShipFirstNameKana,ShipLastNameKana,ShipZipCode,ShipPrefecture,ShipCity,ShipAddress1,"
+    "ShipAddress2,ShipPhoneNumber,BillFirstName,BillLastName,BillFirstNameKana,BillLastNameKana,BillMailAddress,BillZipCode,"
+    "BillPrefecture,BillCity,BillAddress1,BillAddress2,BillPhoneNumber,TotalPrice,ShipCharge,PayCharge,TotalMallCouponDiscount,"
+    "UsePoint,LineId,ItemId,SubCode,Title,Quantity,UnitPrice,YahooAuctionMerchantId")
+
+
+def yahoo_api(cfg):
+    """(yahoo_shopping_api, その設定)。設定・トークンが無いときは RuntimeError。"""
+    import yahoo_shopping_api as yapi
+    try:
+        return yapi, yapi.load_config(config_file=cfg["yahoo_config"])
+    except SystemExit as e:
+        raise RuntimeError(f"ヤフー: {e}")
+
+
+def fetch_yahoo(cfg, log):
+    """ヤフー（ヤフオク店・ヤフーショッピング店）の「処理中・入金済・出荷可」の注文を注文APIで取る。
+    出荷できるかどうかはヤフーのステータスで決まるので、「注文日がこの日時以降」は使わず yahoo_days 日前までさかのぼる。"""
+    if not cfg["yahoo_config"]:
+        log("ヤフー: 設定ファイル（yahoo_shopping_config.ini）が無いため取得しません")
+        return []
+    yapi, ycfg = yahoo_api(cfg)
+    now = datetime.now(JST)
+    start = now - timedelta(days=cfg["yahoo_days"])
+    try:
+        found = yapi.search_orders(ycfg, start, now, YAHOO_READY, "OrderId")
+        log(f"ヤフー: 入金済み・出荷可の注文 {len(found)}件（{start:%m/%d} 以降の注文）。詳細を1件1秒で取ります")
+        orders = []
+        for n, f in enumerate(found, 1):
+            time.sleep(1)  # 1クエリー/秒
+            orders.append(yahoo_api_order(cfg, yapi.order_detail(ycfg, f["OrderId"], YAHOO_DETAIL_FIELDS)))
+            if n % 20 == 0:
+                log(f"ヤフー: 詳細を取得中 {n}/{len(found)}")
+    except SystemExit as e:  # トークンの期限切れなど
+        raise RuntimeError(f"ヤフー: {e}")
+    return orders
+
+
+def yahoo_api_order(cfg, d):
+    """注文詳細API の1件を出荷データの注文にする（read_yahoo と同じ列の使い方）。"""
+    auction = d.get("IsYahooAuctionOrder") == "true"
+    oid = d.get("OrderId", "")
+    # 注文APIの注文IDは「ストアアカウント-番号」で、ワサビの注文番号と同じ形
+    number = oid if oid.startswith(cfg["yahoo_prefix"]) else f"{cfg['yahoo_prefix']}{oid}"
+    o = new_order(cfg["mall"]["yahoo" if auction else "yahoo_shopping"], number, parse_dt(d.get("OrderTime")))
+    o["api"] = {"order_id": oid, "seen": d.get("IsSeen") == "true"}  # 出力後に「出荷処理中」にするため
+    set_buyer(o, join(d.get("BillLastName"), d.get("BillFirstName")), join(d.get("BillLastNameKana"), d.get("BillFirstNameKana")),
+              d.get("BillMailAddress", ""), d.get("BillPrefecture", ""), d.get("BillZipCode", ""), d.get("BillCity", ""),
+              join(d.get("BillAddress1"), d.get("BillAddress2")), d.get("BillPhoneNumber", ""))
+    set_dest(o, join(d.get("ShipLastName"), d.get("ShipFirstName")), join(d.get("ShipLastNameKana"), d.get("ShipFirstNameKana")),
+             d.get("ShipPhoneNumber", ""), d.get("ShipPrefecture", ""), d.get("ShipZipCode", ""), d.get("ShipCity", ""),
+             join(d.get("ShipAddress1"), d.get("ShipAddress2")))
+    # TotalPrice はモールクーポン・ポイント適用後の支払額（注文CSVの Total と同じ）
+    o["head"].update({"お支払方法": d.get("PayMethodName", ""), "入金日": fmt_day(parse_dt(d.get("PayDate"))),
+                      "お届け日指定": d.get("ShipRequestDate", ""), "お届け時間帯指定": d.get("ShipRequestTime", ""),
+                      "備考": d.get("BuyerComments", "").strip(), "送料": num(d.get("ShipCharge")),
+                      "代引き手数料": num(d.get("PayCharge")), "値引き": abs(num(d.get("TotalMallCouponDiscount"))),
+                      "使用ポイント": num(d.get("UsePoint")), "合計": num(d.get("TotalPrice")), "請求合計": num(d.get("TotalPrice"))})
+    # ヤフオク店は ItemId が AUCTION… なので、出品時の商品コード（YahooAuctionMerchantId）を使う。
+    # これは商品ごとではなく注文に1つ（注文CSVの D列と同じ）なので、まとめて取引の2つ目以降は下で探す
+    merchant = line_values(d.get("YahooAuctionMerchantId")) if auction else []
+    for i, it in enumerate(d["Item"]):
+        title = it.get("Title", "")
+        code = (merchant[i] if i < len(merchant) else "") if auction else it.get("ItemId", "")
+        if not code:
+            found = SKU_IN_TEXT.findall(title)  # 無ければタイトルの商品番号（それも無ければ fill_missing_skus でワサビから探す）
+            code = found[-1] if found else ""
+        price, qty = num(it.get("UnitPrice")), num(it.get("Quantity")) or 1
+        o["items"].append((title, code.upper(), price, qty))
+        o["head"]["小計"] += price * qty
+    return o
+
+
+def yahoo_after_export(cfg, exported, log):
+    """出力したヤフーの注文をヤフー側で「出荷処理中」にし（新規注文なら閲覧済みにも）、
+    未入金の新規注文を閲覧済みにして「入金待ち」へ移す。失敗した注文はログに出して続ける。"""
+    yapi, ycfg = yahoo_api(cfg)
+    failed, done = [], 0
+    try:
+        for o in exported:
+            oid = o["api"]["order_id"]
+            try:
+                time.sleep(1)  # 1クエリー/秒
+                yapi.set_ship_status(ycfg, oid, 2)
+                done += 1
+                if not o["api"]["seen"]:
+                    time.sleep(1)
+                    yapi.mark_seen(ycfg, oid)
+            except (yapi.ApiError, RuntimeError) as e:
+                failed.append(f"{oid}（{e}）")
+        if exported:
+            log(f"ヤフー: 出力した注文 {done}件をヤフーで「出荷処理中」にしました")
+        now = datetime.now(JST)
+        unpaid = yapi.search_orders(ycfg, now - timedelta(days=cfg["yahoo_days"]), now, YAHOO_UNPAID_NEW, "OrderId")
+        moved = 0
+        for u in unpaid:
+            try:
+                time.sleep(1)
+                yapi.mark_seen(ycfg, u["OrderId"])
+                moved += 1
+            except (yapi.ApiError, RuntimeError) as e:
+                failed.append(f"{u['OrderId']}（{e}）")
+        if unpaid:
+            log(f"ヤフー: 未入金の新規注文 {moved}件を閲覧済みにして「入金待ち」へ移しました")
+    except SystemExit as e:  # トークンの期限切れなど
+        raise RuntimeError(f"ヤフー: {e}（出荷データは作成済みです。ステータスはストアクリエイターProで変更してください）")
+    if failed:
+        log(f"！ ヤフー: ステータスを変えられなかった注文 {len(failed)}件（ストアクリエイターProで確認してください）")
+        for f in failed[:20]:
+            log(f"   {f}")
+
+
 # ---------------------------------------------------------------- ワサビスイッチ（商品コードが分からない商品を商品名から探す）
 
 TITLE_CODE = re.compile(r"^([A-Za-z]\d{3}-(\d{4})-\d{2})(?=\s)")  # タイトル先頭の管理コード（例 m543-0011-15）
@@ -874,14 +997,17 @@ def find_duplicates(out, history):
     return alerts, losers
 
 
-def create(cfg, since, files, use_rakuten, skip_done, hold_dupes, log, navi=()):
-    """注文を集めて出荷データを作る。navi は取引ナビから読み取ったヤフオク1の注文。
-    戻り値は (作ったファイル or None, 重複アラート行)。"""
+def create(cfg, since, files, use_rakuten, skip_done, hold_dupes, log, navi=(), use_yahoo=False):
+    """注文を集めて出荷データを作る。navi は取引ナビから読み取ったヤフオク1の注文。use_yahoo ならヤフーを注文APIで取り、
+    出力した注文をヤフー側で「出荷処理中」にする。戻り値は (作ったファイル or None, 重複アラート行)。"""
     history = load_history()
     collected, shipped, shipped_files = [], set(), 0
     if navi:
         log(f"ヤフオク1: 取引ナビから注文 {len(navi)}件")
         collected += [("auction", o) for o in navi]
+    if use_yahoo:
+        # 注文CSV（download.csv）も追加されていたら、同じ注文は先に入れた API の方を使う
+        collected += [("yahoo", o) for o in fetch_yahoo(cfg, log)]
     cfg["yahoo_items"] = {}
     order_files = []
     for f in files:
@@ -920,7 +1046,8 @@ def create(cfg, since, files, use_rakuten, skip_done, hold_dupes, log, navi=()):
         if key in seen:
             continue
         seen.add(key)
-        if o["ordered"] and o["ordered"] < since and mall != "auction":  # 取引ナビは貼り付けた分をすべて対象にする
+        # 取引ナビは貼り付けた分を、ヤフーの注文APIは出荷可の注文をすべて対象にする
+        if o["ordered"] and o["ordered"] < since and mall != "auction" and "api" not in o:
             old += 1
         elif o["head"]["注文番号"] in shipped:
             in_list += 1
@@ -966,6 +1093,8 @@ def create(cfg, since, files, use_rakuten, skip_done, hold_dupes, log, navi=()):
     if not out:
         save_history(history)
         log("出力する注文はありません。")
+        if use_yahoo:
+            yahoo_after_export(cfg, [], log)
         return None, alerts
     out.sort(key=lambda x: (x[2]["ordered"] or datetime.min.replace(tzinfo=JST)))
     path = write_csv(cfg, [o for _, _, o in out], f"order-{stamp:%Y%m%d%H%M%S}.csv")
@@ -981,6 +1110,8 @@ def create(cfg, since, files, use_rakuten, skip_done, hold_dupes, log, navi=()):
         by[mall] = by.get(mall, 0) + 1
     log(f"作成しました: {path.name}（注文 {len(out)}件 / 行数 {sum(len(o['items']) for _, _, o in out)}）  "
         + " / ".join(f"{MALL_JA[m]} {n}件" for m, n in by.items()))
+    if use_yahoo:
+        yahoo_after_export(cfg, [o for _, _, o in out if "api" in o], log)
     return path, alerts
 
 
@@ -1489,14 +1620,18 @@ def main_gui():
 
     rak_var = tk.BooleanVar(value=bool(cfg["rakuten_secret"] and cfg["rakuten_key"]))
     tk.Checkbutton(frm, text="楽天の発送待ち注文を API で取得する", variable=rak_var).grid(row=1, column=0, columnspan=2, sticky="w")
+    yahoo_var = tk.BooleanVar(value=bool(cfg["yahoo_config"]))
+    tk.Checkbutton(frm, text="ヤフー（ヤフオク店・ショッピング）の入金済み・出荷可の注文を API で取得する"
+                             "（出力した注文はヤフーで「出荷処理中」にする）",
+                   variable=yahoo_var).grid(row=2, column=0, columnspan=2, sticky="w")
     skip_var = tk.BooleanVar(value=True)
-    tk.Checkbutton(frm, text="出力済みの注文は除く（二重出荷を防ぐ）", variable=skip_var).grid(row=2, column=0, columnspan=2, sticky="w")
+    tk.Checkbutton(frm, text="出力済みの注文は除く（二重出荷を防ぐ）", variable=skip_var).grid(row=3, column=0, columnspan=2, sticky="w")
     hold_var = tk.BooleanVar(value=True)
     tk.Checkbutton(frm, text="同じ商品の重複注文は、先に注文された方だけ出力する（後の方は「重複注文_要確認」に出す）",
-                   variable=hold_var).grid(row=3, column=0, columnspan=2, sticky="w")
+                   variable=hold_var).grid(row=4, column=0, columnspan=2, sticky="w")
     yesterday = (datetime.now(JST) - timedelta(days=1)).date()
     sf = tk.Frame(frm)
-    sf.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    sf.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
     tk.Label(sf, text="売上集計の発送日").pack(side="left")
     ship_from_var = tk.StringVar(value=yesterday.replace(day=1).strftime("%Y-%m-%d"))
     ship_to_var = tk.StringVar(value=yesterday.strftime("%Y-%m-%d"))
@@ -1510,7 +1645,8 @@ def main_gui():
     yahoo_item_btn = tk.Button(sf, text="商品番号別（ヤフー）", padx=8)
     yahoo_item_btn.pack(side="left")
 
-    tk.Label(root, text="ファイル（出荷済みリスト end-order.csv、Amazon の注文レポート、メルカリ・ヤフオクの注文CSV）", padx=10).pack(anchor="w")
+    tk.Label(root, text="ファイル（出荷済みリスト end-order.csv、Amazon の注文レポート、メルカリの注文CSV。"
+                        "ヤフーを API で取るときはヤフーの注文CSVは不要）", padx=10).pack(anchor="w")
     tk.Label(root, text="ヤフオク1（個人）: 取引ナビのページで Ctrl+A → Ctrl+C してから「取引ナビを貼り付け」（1件ずつ）",
              padx=10).pack(anchor="w")
     lst = tk.Listbox(root, height=6)
@@ -1588,8 +1724,8 @@ def main_gui():
         if not since:
             messagebox.showerror(APP_NAME, "「この日時以降の注文」を 2026-10-21 23:00 のように入力してください")
             return
-        if not rak_var.get() and not files:
-            messagebox.showerror(APP_NAME, "楽天の取得にチェックを入れるか、注文ファイルを追加してください")
+        if not rak_var.get() and not yahoo_var.get() and not files:
+            messagebox.showerror(APP_NAME, "楽天・ヤフーの取得にチェックを入れるか、注文ファイルを追加してください")
             return
         run_btn.configure(state="disabled")
         paths = [f for f in files if isinstance(f, str)]
@@ -1597,7 +1733,8 @@ def main_gui():
 
         def work():
             try:
-                path, alerts = create(cfg, since, paths, rak_var.get(), skip_var.get(), hold_var.get(), log, navi)
+                path, alerts = create(cfg, since, paths, rak_var.get(), skip_var.get(), hold_var.get(), log, navi,
+                                      use_yahoo=yahoo_var.get())
                 if alerts:
                     skus = len({a[0] for a in alerts})
                     lines = "\n".join(f"{a[0]}  {a[1]}: {a[2]} {a[3]}" for a in alerts[:12])
@@ -1678,7 +1815,7 @@ def main_gui():
         log("ワサビのトークンが未設定です（shipping_export.ini の [WASABI]）。ヤフオクのまとめて取引の2つ目以降の商品コードは探しません")
     if not cfg["yahoo_config"]:
         log("ヤフーの設定ファイル（yahoo_shopping_config.ini）が見つかりません（shipping_export.ini の [YAHOO_SHOPPING]）。"
-            "売上集計にヤフーは入りません")
+            "ヤフーの注文は API で取得せず、売上集計にもヤフーは入りません")
     root.mainloop()
 
 

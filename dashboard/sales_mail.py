@@ -98,7 +98,7 @@ def build(folder, send_date):
         return y, c, forecast(c, n_days, elapsed)
 
     total = line(sum(last.values()), sum(cum.values()))
-    body = [f"■売上金額:{total[0]:,}円 / {total[1]:,}円 / {total[2]:,}円", "", "■売上金額"]
+    body = [f"■売上金額:{total[0]:,}円 / {total[1]:,}円 / {total[2]:,}円", ""]
     for name, _ in rows:
         y, c, f = line(last[name], cum[name])
         body += [f"--{name}--", f"{y:,}円  / {c:,}円  / {f:,}円", ""]

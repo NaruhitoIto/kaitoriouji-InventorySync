@@ -464,11 +464,20 @@ def auction_skus(wcfg, title):
     return None, f"ワサビに同じ商品名で在庫ありが{len(in_stock)}件（{', '.join(in_stock[:5])}）"
 
 
+def auction_line_skus(wcfg, title, merchant):
+    """ストアオークションの明細の商品番号。注文APIの「ヤフオクの商品コード」（出品時に付けた商品コード）が商品番号の形なら
+    それを使い、無ければ商品名から探す（auction_skus）。戻り値は auction_skus と同じ (商品番号のリスト, 理由)。"""
+    m = SKU_RE.fullmatch(merchant.strip())
+    if m:
+        return [m.group(1).upper()], "ヤフオクの商品コード"
+    return auction_skus(wcfg, title)
+
+
 def collect_yahoo_shopping(state, now, wcfg):
     """ヤフーショッピングの注文を注文API（注文検索・注文詳細）で取る。
     注文APIがまだ使えない（利用申請の承認待ち）ときは何もせず、使えるようになったら自動で始まる。
     同じ注文管理に入るストアオークション（ヤフオク店）の明細は、商品コードが AUCTION… で商品番号が無いため、
-    商品名から商品番号を探して（auction_skus）他のモールでも在庫0にする。対応前に処理した注文は、
+    注文詳細の「ヤフオクの商品コード」（無ければ商品名から探す。auction_line_skus）で他のモールでも在庫0にする。対応前に処理した注文は、
     最初の1回だけ AUCTION_BACKFILL さかのぼってストアオークションの明細を見直す。"""
     st = state.setdefault("yahoo_store", {"last_checked": now.isoformat(), "processed": []})
     start = max(datetime.fromisoformat(st["last_checked"]) - OVERLAP, now - YAHOO_LOOKBACK)
@@ -500,10 +509,10 @@ def collect_yahoo_shopping(state, now, wcfg):
                 time.sleep(1)  # 1クエリー/秒
                 status, items = yapi.order_items(ycfg, oid)
             if status != "4":
-                for code, _, _, title in items:
+                for code, _, _, title, merchant in items:
                     is_auction = code.upper().startswith("AUCTION")
                     if is_auction or not redo:
-                        found.append((code, title, auction_skus(wcfg, title) if is_auction else None))
+                        found.append((code, title, auction_line_skus(wcfg, title, merchant) if is_auction else None))
         except Exception as e:
             log.error(f"ヤフーショッピングの注文 {oid}: 明細を確かめられませんでした（次回再試行）: {e}")
             complete = False

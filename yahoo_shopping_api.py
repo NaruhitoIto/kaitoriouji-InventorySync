@@ -228,9 +228,11 @@ def order_list(cfg, start, end):
 
 
 def order_items(cfg, order_id):
-    """注文詳細API。(注文ステータス, [(商品コード, サブコード, 数量, 商品名)]) を返す。"""
-    xml = (f"<Req><Target><OrderId>{order_id}</OrderId><Field>OrderId,OrderStatus,LineId,ItemId,SubCode,Quantity,Title</Field>"
-           f"</Target><SellerId>{cfg['seller_id']}</SellerId></Req>")
+    """注文詳細API。(注文ステータス, [(商品コード, サブコード, 数量, 商品名, ヤフオクの商品コード)]) を返す。
+    ストアオークション（ヤフオク店）の明細は商品コードが AUCTION… なので、出品時に付けた商品コード
+    （ItemYahooAucMerchantId。商品ごとにある）を5つ目に入れる。注文単位の YahooAuctionMerchantId は1つ目の商品の分しかない。"""
+    xml = (f"<Req><Target><OrderId>{order_id}</OrderId><Field>OrderId,OrderStatus,LineId,ItemId,SubCode,Quantity,Title,"
+           f"ItemYahooAucMerchantId</Field></Target><SellerId>{cfg['seller_id']}</SellerId></Req>")
     r = call(cfg, "orderInfo", xml=xml)
     if r.status_code != 200:
         raise ApiError("orderInfo", r)
@@ -239,7 +241,7 @@ def order_items(cfg, order_id):
         raise RuntimeError(f"orderInfo: {order_id} の注文情報がありません")
     return info.findtext("OrderStatus") or "", [
         ((it.findtext("ItemId") or "").strip(), (it.findtext("SubCode") or "").strip(), (it.findtext("Quantity") or "").strip(),
-         (it.findtext("Title") or "").strip())
+         (it.findtext("Title") or "").strip(), (it.findtext("ItemYahooAucMerchantId") or "").strip())
         for it in info.iter("Item")]
 
 

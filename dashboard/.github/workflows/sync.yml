@@ -1,0 +1,43 @@
+name: Sync WASABI sales data
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      window_days:
+        description: 'Days to fetch (default 4)'
+        required: false
+        default: '4'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install requests
+
+      - run: python scripts/fetch_sales.py
+        env:
+          WASABI_AUTH: ${{ secrets.WASABI_AUTH }}
+          WINDOW_DAYS: ${{ github.event.inputs.window_days }}
+          RAKUTEN_SERVICE_SECRET: ${{ secrets.RAKUTEN_SERVICE_SECRET }}
+          RAKUTEN_LICENSE_KEY: ${{ secrets.RAKUTEN_LICENSE_KEY }}
+          YAHOO_FROM: ${{ vars.YAHOO_FROM }}
+          YAHOO_AUCTION_FROM: ${{ vars.YAHOO_AUCTION_FROM }}
+
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/latest_sales.json
+          git diff --staged --quiet || git commit -m "Update sales data"
+          git pull --rebase
+          git push

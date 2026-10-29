@@ -35,7 +35,8 @@
 - 今すぐ取得し直す：`gh workflow run dashboard_sync.yml -R NaruhitoIto/kaitoriouji-InventorySync`（過去分もまとめて取るときは `-f window_days=19` など）。
 - ヤフー（ストアAPI：ヤフーショッピング店＝店舗8、ヤフオク店＝店舗6）
   - ストアAPIの注文には、ヤフーショッピング店とヤフオク店（ストアのオークション）の両方が入る。`IsYahooAuctionOrder` で分け、オークション以外を店舗8、オークションを店舗6とする（件数のほとんどはヤフオク店）。
-  - 注文APIは Actions からは呼べないため、固定IPのPCのタスクスケジューラ（`wasabi-yahoo-sync`、毎時05分）が、専用クローン `%LOCALAPPDATA%\InventorySync-dashboard\repo` で `dashboard/yahoo_sync.py --yahoo-config C:\InventorySync\yahoo_shopping_config.ini` を実行し、集計値だけを `dashboard/data/yahoo_sales.json` に書いてプッシュする。Actions の `fetch_sales.py` はそれを `dashboard/yahoo_file.py` で読み、`YAHOO_FROM` 以降の日を店舗8に、`YAHOO_AUCTION_FROM` 以降の日を店舗6に反映する（どちらも 2026-10-17 から）。
+  - 注文APIは Actions からは呼べないため、固定IPのPCのタスクスケジューラ（`wasabi-yahoo-sync`、毎時05分）が、専用クローン `C:\InventorySync-yahoo-task`（作業には使わない）で `dashboard/yahoo_sync.py --yahoo-config C:\InventorySync\yahoo_shopping_config.ini` を実行し、集計値だけを `dashboard/data/yahoo_sales.json` に書いてプッシュする。Actions の `fetch_sales.py` はそれを `dashboard/yahoo_file.py` で読み、`YAHOO_FROM` 以降の日を店舗8に、`YAHOO_AUCTION_FROM` 以降の日を店舗6に反映する（どちらも 2026-10-17 から）。
   - 金額はモールクーポン・ポイント値引き前（`TotalPrice + TotalMallCouponDiscount + UsePoint`、ストアクリエイターProの注文CSVの Sale Total に当たる。楽天の totalPrice と同じ考え方）。
-  - ログ：`%LOCALAPPDATA%\InventorySync-dashboard\yahoo_sync.log`。
+  - ログ・数量のキャッシュ：`%LOCALAPPDATA%\InventorySync-dashboard\`（`yahoo_sync.log`、`yahoo_qty_cache.json`）。
+  - Claude のデスクトップアプリから `%LOCALAPPDATA%`（AppData）に作ったファイル・フォルダは、アプリ専用の場所に振り替えられてタスクスケジューラからは見えない。タスクが使うファイルを Claude が用意するときは AppData の外（`C:\` 直下など）に置く。
 - 2026-10-29 に wasabi-dashboard-sync リポジトリ（アーカイブ済み）から履歴ごと移した。

@@ -12,7 +12,7 @@ WASABI SWITCH の売上集計を GitHub Actions で取得し、`data/latest_sale
 
 ## ヤフー（ストアAPI：ヤフーショッピング店＝店舗8、ヤフオク店＝店舗6）
 - ストアAPIの注文には、ヤフーショッピング店とヤフオク店（ストアのオークション）の両方が入る。`IsYahooAuctionOrder` で分け、オークション以外を店舗8、オークションを店舗6とする（件数のほとんどはヤフオク店）。
-- 注文APIは申請した固定IPのPCからしか呼べないため、Actions では呼ばない。そのPCのタスクスケジューラ（`wasabi-yahoo-sync`、毎時05分）が、専用クローン `%LOCALAPPDATA%\wasabi-dashboard-sync\repo` で `scripts/yahoo_sync.py` を実行し、集計値だけを `data/yahoo_sales.json` に書いてプッシュする。Actions の `fetch_sales.py` はそれを `scripts/yahoo_file.py` で読み、`YAHOO_FROM` 以降の日を店舗8に、`YAHOO_AUCTION_FROM` 以降の日を店舗6に反映する。
+- 注文APIは申請した固定IPのPCからしか呼べないため、Actions では呼ばない。そのPCのタスクスケジューラ（`wasabi-yahoo-sync`、毎時05分）が、専用クローン `%LOCALAPPDATA%\wasabi-dashboard-sync\repo` で `scripts/yahoo_sync.py` を実行し、集計値だけを `data/yahoo_sales.json` に書いてプッシュする。Actions の `fetch_sales.py` はそれを `scripts/yahoo_file.py` で読み、`YAHOO_FROM` 以降の日を店舗8に、`YAHOO_AUCTION_FROM` 以降の日を店舗6に反映する（どちらも 2026-10-17 から）。
 - 認証情報（`YAHOO_CLIENT_ID`、`YAHOO_CLIENT_SECRET`、`YAHOO_REFRESH_TOKEN`、`YAHOO_SELLER_ID`、`YAHOO_REDIRECT_URI`、`YAHOO_PUBLIC_KEY_PATH`、`YAHOO_PUBLIC_KEY_VERSION`）はそのPCのユーザー環境変数。公開鍵ファイルはリポジトリの外に置く。
 - 公開鍵認証を使っているので再認可は4週間ごと。期限は `data/yahoo_sales.json` の `auth_expires`。そのPCで `python scripts/yahoo_auth.py` を実行してブラウザでログインし直す（期限前なら同じトークンのまま期限が延びる）。公開鍵は1年ごとに更新。
 - 金額はモールクーポン・ポイント値引き前（`TotalPrice + TotalMallCouponDiscount + UsePoint`、ストアクリエイターProの注文CSVの Sale Total に当たる。楽天の totalPrice と同じ考え方）。

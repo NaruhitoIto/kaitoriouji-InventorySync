@@ -13,9 +13,9 @@ BASE = "https://world-switch.com/kaitoriouji/ext"
 # それより前の日付はWASABIの値を残し、APIの値はログに比較表示するだけ。
 RAKUTEN_FROM = os.environ.get("RAKUTEN_FROM") or "2026-10-17"
 # ヤフーのストアAPIの注文は、オークション以外がヤフーショッピング(id:8)、オークションがヤフオク店(id:6)。
-# ショッピングは楽天と同じ日から差し替える。ヤフオク店は切替日を決めるまでは未来日=比較ログのみ。
+# どちらも楽天と同じ日から差し替える(WASABIの受注はキャンセル込みで、APIはキャンセルを除く)。
 YAHOO_FROM = os.environ.get("YAHOO_FROM") or "2026-10-17"
-YAHOO_AUCTION_FROM = os.environ.get("YAHOO_AUCTION_FROM") or "9999-12-31"
+YAHOO_AUCTION_FROM = os.environ.get("YAHOO_AUCTION_FROM") or "2026-10-17"
 # (ログ名, モジュール, WASABIのshop_id, 置き換え開始日)
 # ヤフーの注文APIは固定IPのPCからしか呼べないため、そのPCが書いた data/yahoo_sales.json を読む。
 API_SOURCES = [

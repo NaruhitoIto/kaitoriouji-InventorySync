@@ -6,18 +6,19 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 import rakuten_rms
-import yahoo_store
+import yahoo_file
 
 BASE = "https://world-switch.com/kaitoriouji/ext"
 # この日付以降は該当店舗をモールAPIの値で差し替える。
 # それより前の日付はWASABIの値を残し、APIの値はログに比較表示するだけ。
 RAKUTEN_FROM = os.environ.get("RAKUTEN_FROM") or "2026-10-17"
-# ヤフーショッピング(id:8)。切替日を決めるまでは未来日=比較ログのみ。ヤフオク(id:6)はWASABIのまま。
-YAHOO_FROM = os.environ.get("YAHOO_FROM") or "9999-12-31"
+# ヤフーショッピング(id:8)。楽天と同じ日から差し替える。ヤフオク(id:6)はWASABIのまま。
+YAHOO_FROM = os.environ.get("YAHOO_FROM") or "2026-10-17"
 # (ログ名, モジュール, WASABIのshop_id, 置き換え開始日)
+# ヤフーの注文APIは固定IPのPCからしか呼べないため、そのPCが書いた data/yahoo_sales.json を読む。
 API_SOURCES = [
     ("rakuten", rakuten_rms, 1, RAKUTEN_FROM),
-    ("yahoo", yahoo_store, 8, YAHOO_FROM),
+    ("yahoo", yahoo_file, 8, YAHOO_FROM),
 ]
 AUTH = os.environ["WASABI_AUTH"]
 HEADERS = {"Authorization": f"Bearer {AUTH}"}

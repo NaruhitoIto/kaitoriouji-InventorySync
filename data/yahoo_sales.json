@@ -1,0 +1,34 @@
+{
+  "generated_at": "2026-10-29T10:21:24Z",
+  "auth_expires": "2026-11-26",
+  "days": {
+    "2026-10-26": {
+      "ordered": 1789242,
+      "qty": 243,
+      "count": 228,
+      "shipped": 1674578,
+      "shipped_count": 232
+    },
+    "2026-10-27": {
+      "ordered": 1708618,
+      "qty": 191,
+      "count": 172,
+      "shipped": 1785700,
+      "shipped_count": 227
+    },
+    "2026-10-28": {
+      "ordered": 822955,
+      "qty": 140,
+      "count": 133,
+      "shipped": 1668550,
+      "shipped_count": 174
+    },
+    "2026-10-29": {
+      "ordered": 351576,
+      "qty": 76,
+      "count": 62,
+      "shipped": 830310,
+      "shipped_count": 120
+    }
+  }
+}

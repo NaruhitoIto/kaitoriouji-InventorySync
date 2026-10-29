@@ -31,10 +31,6 @@ jobs:
           WINDOW_DAYS: ${{ github.event.inputs.window_days }}
           RAKUTEN_SERVICE_SECRET: ${{ secrets.RAKUTEN_SERVICE_SECRET }}
           RAKUTEN_LICENSE_KEY: ${{ secrets.RAKUTEN_LICENSE_KEY }}
-          YAHOO_CLIENT_ID: ${{ secrets.YAHOO_CLIENT_ID }}
-          YAHOO_CLIENT_SECRET: ${{ secrets.YAHOO_CLIENT_SECRET }}
-          YAHOO_REFRESH_TOKEN: ${{ secrets.YAHOO_REFRESH_TOKEN }}
-          YAHOO_SELLER_ID: ${{ secrets.YAHOO_SELLER_ID }}
           YAHOO_FROM: ${{ vars.YAHOO_FROM }}
 
       - run: |
@@ -42,4 +38,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/latest_sales.json
           git diff --staged --quiet || git commit -m "Update sales data"
+          git pull --rebase
           git push

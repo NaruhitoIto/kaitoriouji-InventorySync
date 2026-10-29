@@ -6,6 +6,7 @@ data/yahoo_sales.json に書いてプッシュする。Actions の fetch_sales.p
 - 数量のキャッシュ(注文ID → 数量)はリポジトリの外(%LOCALAPPDATA%)に置く。
 
 使い方: python scripts/yahoo_sync.py [--days 4] [--no-git]
+タスクスケジューラからは pythonw.exe(ウィンドウを出さない)で --log <ファイル> を付けて実行する。
 """
 import argparse
 import json
@@ -33,7 +34,9 @@ ENV_NAMES = ("YAHOO_CLIENT_ID", "YAHOO_CLIENT_SECRET", "YAHOO_REFRESH_TOKEN", "Y
 
 
 def git(*args, check=True):
-    return subprocess.run(["git", "-C", REPO, *args], check=check, capture_output=True, text=True)
+    # pythonw から呼んでも git のコンソールウィンドウが開かないようにする
+    return subprocess.run(["git", "-C", REPO, *args], check=check, capture_output=True, text=True,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 def load_json(path, default):
@@ -85,7 +88,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=4, help="今日から遡って取得する日数")
     ap.add_argument("--no-git", action="store_true", help="pull / commit / push をしない(試験用)")
+    ap.add_argument("--log", help="出力をこのファイルに追記する(タスクスケジューラ用)")
     args = ap.parse_args()
+    if args.log:
+        sys.stdout = sys.stderr = open(args.log, "a", encoding="utf-8", buffering=1)
     print(f"--- {datetime.now(JST):%Y-%m-%d %H:%M} yahoo_sync --days {args.days}")
     acquire_lock()
     try:

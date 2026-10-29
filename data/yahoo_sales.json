@@ -1,97 +1,215 @@
 {
-  "generated_at": "2026-10-29T11:05:25Z",
+  "format": 2,
+  "generated_at": "2026-10-29T11:06:35Z",
   "auth_expires": "2026-11-26",
   "days": {
     "2026-10-17": {
-      "ordered": 1641028,
-      "qty": 193,
-      "count": 187,
-      "shipped": 1704835,
-      "shipped_count": 218
+      "shopping": {
+        "ordered": 1181,
+        "qty": 2,
+        "count": 2,
+        "shipped": 3045,
+        "shipped_count": 3
+      },
+      "auction": {
+        "ordered": 1639847,
+        "qty": 191,
+        "count": 185,
+        "shipped": 1701790,
+        "shipped_count": 215
+      }
     },
     "2026-10-18": {
-      "ordered": 1965204,
-      "qty": 258,
-      "count": 245,
-      "shipped": 1701940,
-      "shipped_count": 187
+      "shopping": {
+        "ordered": 4939,
+        "qty": 1,
+        "count": 1,
+        "shipped": 1181,
+        "shipped_count": 2
+      },
+      "auction": {
+        "ordered": 1960265,
+        "qty": 257,
+        "count": 244,
+        "shipped": 1700759,
+        "shipped_count": 185
+      }
     },
     "2026-10-19": {
-      "ordered": 1543333,
-      "qty": 183,
-      "count": 164,
-      "shipped": 2163055,
-      "shipped_count": 277
+      "shopping": {
+        "ordered": 2123,
+        "qty": 1,
+        "count": 1,
+        "shipped": 7062,
+        "shipped_count": 2
+      },
+      "auction": {
+        "ordered": 1541210,
+        "qty": 182,
+        "count": 163,
+        "shipped": 2155993,
+        "shipped_count": 275
+      }
     },
     "2026-10-20": {
-      "ordered": 1867540,
-      "qty": 254,
-      "count": 227,
-      "shipped": 655635,
-      "shipped_count": 62
+      "shopping": {
+        "ordered": 2000,
+        "qty": 1,
+        "count": 1,
+        "shipped": 0,
+        "shipped_count": 0
+      },
+      "auction": {
+        "ordered": 1865540,
+        "qty": 253,
+        "count": 226,
+        "shipped": 655635,
+        "shipped_count": 62
+      }
     },
     "2026-10-21": {
-      "ordered": 1175783,
-      "qty": 167,
-      "count": 156,
-      "shipped": 1212797,
-      "shipped_count": 140
+      "shopping": {
+        "ordered": 0,
+        "qty": 0,
+        "count": 0,
+        "shipped": 0,
+        "shipped_count": 0
+      },
+      "auction": {
+        "ordered": 1175783,
+        "qty": 167,
+        "count": 156,
+        "shipped": 1212797,
+        "shipped_count": 140
+      }
     },
     "2026-10-22": {
-      "ordered": 1030113,
-      "qty": 165,
-      "count": 157,
-      "shipped": 1129766,
-      "shipped_count": 138
+      "shopping": {
+        "ordered": 6907,
+        "qty": 3,
+        "count": 3,
+        "shipped": 0,
+        "shipped_count": 0
+      },
+      "auction": {
+        "ordered": 1023206,
+        "qty": 162,
+        "count": 154,
+        "shipped": 1129766,
+        "shipped_count": 138
+      }
     },
     "2026-10-23": {
-      "ordered": 1596161,
-      "qty": 175,
-      "count": 164,
-      "shipped": 2136377,
-      "shipped_count": 310
+      "shopping": {
+        "ordered": 3906,
+        "qty": 4,
+        "count": 4,
+        "shipped": 8907,
+        "shipped_count": 4
+      },
+      "auction": {
+        "ordered": 1592255,
+        "qty": 171,
+        "count": 160,
+        "shipped": 2127470,
+        "shipped_count": 306
+      }
     },
     "2026-10-24": {
-      "ordered": 1801617,
-      "qty": 243,
-      "count": 224,
-      "shipped": 1960206,
-      "shipped_count": 173
+      "shopping": {
+        "ordered": 0,
+        "qty": 0,
+        "count": 0,
+        "shipped": 451,
+        "shipped_count": 1
+      },
+      "auction": {
+        "ordered": 1801617,
+        "qty": 243,
+        "count": 224,
+        "shipped": 1959755,
+        "shipped_count": 172
+      }
     },
     "2026-10-25": {
-      "ordered": 1641768,
-      "qty": 243,
-      "count": 232,
-      "shipped": 1763459,
-      "shipped_count": 229
+      "shopping": {
+        "ordered": 3245,
+        "qty": 5,
+        "count": 5,
+        "shipped": 3455,
+        "shipped_count": 3
+      },
+      "auction": {
+        "ordered": 1638523,
+        "qty": 238,
+        "count": 227,
+        "shipped": 1760004,
+        "shipped_count": 226
+      }
     },
     "2026-10-26": {
-      "ordered": 1789242,
-      "qty": 243,
-      "count": 228,
-      "shipped": 1674578,
-      "shipped_count": 232
+      "shopping": {
+        "ordered": 906,
+        "qty": 2,
+        "count": 2,
+        "shipped": 0,
+        "shipped_count": 0
+      },
+      "auction": {
+        "ordered": 1788336,
+        "qty": 241,
+        "count": 226,
+        "shipped": 1674578,
+        "shipped_count": 232
+      }
     },
     "2026-10-27": {
-      "ordered": 1708618,
-      "qty": 191,
-      "count": 172,
-      "shipped": 1785700,
-      "shipped_count": 227
+      "shopping": {
+        "ordered": 2194,
+        "qty": 3,
+        "count": 2,
+        "shipped": 3677,
+        "shipped_count": 6
+      },
+      "auction": {
+        "ordered": 1706424,
+        "qty": 188,
+        "count": 170,
+        "shipped": 1782023,
+        "shipped_count": 221
+      }
     },
     "2026-10-28": {
-      "ordered": 822955,
-      "qty": 140,
-      "count": 133,
-      "shipped": 1668550,
-      "shipped_count": 174
+      "shopping": {
+        "ordered": 480,
+        "qty": 1,
+        "count": 1,
+        "shipped": 1762,
+        "shipped_count": 2
+      },
+      "auction": {
+        "ordered": 822475,
+        "qty": 139,
+        "count": 132,
+        "shipped": 1666788,
+        "shipped_count": 172
+      }
     },
     "2026-10-29": {
-      "ordered": 350027,
-      "qty": 74,
-      "count": 60,
-      "shipped": 830310,
-      "shipped_count": 120
+      "shopping": {
+        "ordered": 1004,
+        "qty": 2,
+        "count": 1,
+        "shipped": 1386,
+        "shipped_count": 2
+      },
+      "auction": {
+        "ordered": 349023,
+        "qty": 72,
+        "count": 59,
+        "shipped": 828924,
+        "shipped_count": 118
+      }
     }
   }
 }

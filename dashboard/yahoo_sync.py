@@ -158,6 +158,7 @@ def main():
     ap.add_argument("--yahoo-config", help="yahoo_shopping_config.ini のパス(省略時はこのリポジトリ直下のもの)")
     args = ap.parse_args()
     if args.log:
+        os.makedirs(os.path.dirname(os.path.abspath(args.log)), exist_ok=True)
         sys.stdout = sys.stderr = open(args.log, "a", encoding="utf-8", buffering=1)
     print(f"--- {datetime.now(JST):%Y-%m-%d %H:%M} yahoo_sync --days {args.days}")
     acquire_lock()

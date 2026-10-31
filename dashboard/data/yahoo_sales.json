@@ -1,6 +1,6 @@
 {
   "format": 2,
-  "generated_at": "2026-10-31T13:05:26Z",
+  "generated_at": "2026-10-31T14:08:04Z",
   "auth_expires": "2026-11-27",
   "days": {
     "2026-10-17": {
@@ -236,9 +236,9 @@
         "shipped_count": 2
       },
       "auction": {
-        "ordered": 1292988,
-        "qty": 127,
-        "count": 112,
+        "ordered": 1979795,
+        "qty": 228,
+        "count": 213,
         "shipped": 1108516,
         "shipped_count": 118
       }
